@@ -1,0 +1,21 @@
+[package]
+name = "grout"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.5.60", features = ["derive"] }
+cuda-async = { path = "../cuda-tile-rust/cuda-async" }
+cudarc = { version = "0.19.2", default-features = false, features = ["std", "cublas", "dynamic-loading", "cuda-13010"] }
+memmap2 = "0.9.10"
+nv_cuda = { package = "nv-cuda", path = "../cuda-tile-rust/nv-cuda" }
+rand = "0.8.5"
+rayon = "1.11.0"
+safetensors = "0.7.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tile-rust = { path = "../cuda-tile-rust/tile-rust" }
+tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros"] }
+tokenizers = "0.20.4"
+candle-core = "0.9.2"
