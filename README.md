@@ -4,17 +4,15 @@ A Qwen 3 inference engine written in Rust, build using [cutile-rs](https://githu
 
 ## Usage
 
-Follow the installation guide of `cutile-rs`, then run:
+1) Follow the [installation guide of `cutile-rs`](https://github.com/NVlabs/cutile-rs?tab=readme-ov-file#install).
+2) Configure your [environment variables for `cutile-rs`](https://github.com/NVlabs/cutile-rs?tab=readme-ov-file#configure-environment).
+
+- Set `CUDA_TOOLKIT_PATH` to your CUDA 13.2 install directory.
+- Ensure `llvm-config` points to LLVM 21. This is required by `melior`. Or, set `LLVM_SYSPATHXX`. 
+- Set `CUDA_TILE_USE_LLVM_INSTALL_DIR` to your LLVM 21 install directory (for example `/usr/lib/llvm-21`). This is required by `cutile-rs`.
 
 ```
-cargo +nightly run --release -- --model <path-to-qwen3-model> --prompt "Hello, how are you?" --max-new-tokens 128
-```
-
-Depending on your machine's environment, you might need to set environment paths more explicitly:
-```
-CUDA_TOOLKIT_PATH=/usr/local/cuda-13.1 LLVM_SYSPATHXX=/usr/lib/llvm-21 RUSTFLAGS="-C target-cpu=native" PATH="/usr/local/cuda-13.1/bin:$PATH" cargo +nightly run --release -- --model <path-to-qwen3-model> --prompt "Hello, how are you?"
-
-CUDA_TOOLKIT_PATH=/usr/local/cuda-13.1 LLVM_SYSPATHXX=/usr/lib/llvm-21 RUSTFLAGS="-C target-cpu=native" PATH="/usr/local/cuda-13.1/bin:$PATH" GROUT_CUDA_GRAPH_DECODE=1 GROUT_CUBLAS_COMPUTE16=1 GROUT_ATTN_BN_DECODE=64 cargo +nightly run --release -- --modek <path-to-qwen3-model> --prompt "Hello"
+CUDA_TILE_USE_LLVM_INSTALL_DIR=/usr/lib/llvm-21 cargo +nightly run --release -- --model <path-to-qwen3-model> --prompt "Hello, how are you?" --max-new-tokens 128
 ```
 
 ### Options
