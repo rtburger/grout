@@ -45,8 +45,7 @@ pub mod kernels {
 
     #[cutile::entry(print_ir=false,
                        optimization_hints = (
-                         tensor_dim_factor = 16,
-                         sm_120 = (occupancy=1,),
+                         sm_120 = (occupancy=1, max_divisibility=16,),
                        ))]
     fn gemm_f16<const BM: i32, const BN: i32, const BK: i32, const K: i32>(
         z: &mut Tensor<f16, { [BM, BN] }>,
@@ -71,8 +70,7 @@ pub mod kernels {
 
     #[cutile::entry(print_ir=false,
                        optimization_hints = (
-                         tensor_dim_factor = 16,
-                         sm_120 = (occupancy=1,),
+                         sm_120 = (occupancy=1, max_divisibility=16,),
                        ))]
     fn add_vec_f16<const S: [i32; 1]>(
         out: &mut Tensor<f16, S>,
@@ -86,8 +84,7 @@ pub mod kernels {
 
     #[cutile::entry(print_ir=false,
                        optimization_hints = (
-                         tensor_dim_factor = 16,
-                         sm_120 = (occupancy=1,),
+                         sm_120 = (occupancy=1, max_divisibility=16,),
                        ))]
     fn add_2d_f16<const BLOCK_SIZE: i32>(
         out: &mut Tensor<f16, { [1, BLOCK_SIZE] }>,
@@ -108,8 +105,7 @@ pub mod kernels {
 
     #[cutile::entry(print_ir=false,
                        optimization_hints = (
-                         tensor_dim_factor = 16,
-                         sm_120 = (occupancy=1,),
+                         sm_120 = (occupancy=1, max_divisibility=16,),
                        ))]
     fn silu_mul_vec_f16<const S: [i32; 1]>(
         out: &mut Tensor<f16, S>,
@@ -133,8 +129,7 @@ pub mod kernels {
 
     #[cutile::entry(print_ir=false,
                        optimization_hints = (
-                         tensor_dim_factor = 16,
-                         sm_120 = (occupancy=1,),
+                         sm_120 = (occupancy=1, max_divisibility=16,),
                        ))]
     fn silu_mul_2d_f16<const BLOCK_SIZE: i32>(
         out: &mut Tensor<f16, { [1, BLOCK_SIZE] }>,
@@ -165,8 +160,7 @@ pub mod kernels {
 
     #[cutile::entry(print_ir=false,
                        optimization_hints = (
-                         tensor_dim_factor = 16,
-                         sm_120 = (occupancy=1,),
+                         sm_120 = (occupancy=1, max_divisibility=16,),
                        ))]
     fn rms_norm_f16<const N: i32, const BLOCK_SIZE: i32>(
         x: &Tensor<f16, { [-1, N] }>,
@@ -211,8 +205,7 @@ pub mod kernels {
 
     #[cutile::entry(print_ir=false,
                        optimization_hints = (
-                         tensor_dim_factor = 16,
-                         sm_120 = (occupancy=1,),
+                         sm_120 = (occupancy=1, max_divisibility=16,),
                        ))]
     fn argmax_blocks_f16<const BLOCK_SIZE: i32>(
         logits: &Tensor<f16, { [-1] }>,
@@ -263,8 +256,7 @@ pub mod kernels {
 
     #[cutile::entry(print_ir=false,
                        optimization_hints = (
-                         tensor_dim_factor = 16,
-                         sm_120 = (occupancy=1,),
+                         sm_120 = (occupancy=1, max_divisibility=16,),
                        ))]
     fn gather_row_f16<const BLOCK_SIZE: i32>(
         src: &Tensor<f16, { [-1, -1] }>,
@@ -281,8 +273,7 @@ pub mod kernels {
 
     #[cutile::entry(print_ir=false,
                        optimization_hints = (
-                         tensor_dim_factor = 16,
-                         sm_120 = (occupancy=1,),
+                         sm_120 = (occupancy=1, max_divisibility=16,),
                        ))]
     fn rope_f16<const D: i32, const HALF_D: i32>(
         x: &mut Tensor<f16, { [1, D] }>,
@@ -319,8 +310,7 @@ pub mod kernels {
 
     #[cutile::entry(print_ir=false,
                        optimization_hints = (
-                         tensor_dim_factor = 16,
-                         sm_120 = (occupancy=1,),
+                         sm_120 = (occupancy=1, max_divisibility=16,),
                        ))]
     fn rope_seq_f16<const D: i32, const HALF_D: i32>(
         x: &Tensor<f16, { [-1, -1, D] }>,
@@ -364,8 +354,7 @@ pub mod kernels {
 
     #[cutile::entry(print_ir=false,
                        optimization_hints = (
-                         tensor_dim_factor = 16,
-                         sm_120 = (occupancy=1,),
+                         sm_120 = (occupancy=1, max_divisibility=16,),
                        ))]
     fn rope_seq_dynpos_f16<const D: i32, const HALF_D: i32>(
         x: &Tensor<f16, { [-1, -1, D] }>,
@@ -414,8 +403,7 @@ pub mod kernels {
 
     #[cutile::entry(print_ir=false,
                        optimization_hints = (
-                         tensor_dim_factor = 16,
-                         sm_120 = (occupancy=1,),
+                         sm_120 = (occupancy=1, max_divisibility=16,),
                        ))]
     fn embedding_f16<const D: i32, const BLOCK_SIZE: i32>(
         token_ids: &Tensor<u32, { [-1] }>,
@@ -441,8 +429,7 @@ pub mod kernels {
 
     #[cutile::entry(print_ir=false,
                        optimization_hints = (
-                         tensor_dim_factor = 16,
-                         sm_120 = (occupancy=1,),
+                         sm_120 = (occupancy=1, max_divisibility=16,),
                        ))]
     fn embedding_batch_f16<const D: i32, const BLOCK_SIZE: i32>(
         token_ids: &Tensor<u32, { [-1] }>,
@@ -466,8 +453,7 @@ pub mod kernels {
 
     #[cutile::entry(print_ir=false,
                        optimization_hints = (
-                         tensor_dim_factor = 16,
-                         sm_120 = (occupancy=1,),
+                         sm_120 = (occupancy=1, max_divisibility=16,),
                        ))]
     fn kv_cache_update_f16<const D: i32, const BLOCK_SIZE: i32, const MAX_SEQ: i32>(
         new_k: &Tensor<f16, { [-1, D] }>,
@@ -499,8 +485,7 @@ pub mod kernels {
 
     #[cutile::entry(print_ir=false,
                        optimization_hints = (
-                         tensor_dim_factor = 16,
-                         sm_120 = (occupancy=1,),
+                         sm_120 = (occupancy=1, max_divisibility=16,),
                        ))]
     fn kv_cache_update_seq_f16<const D: i32, const BLOCK_SIZE: i32, const MAX_SEQ: i32>(
         new_k: &Tensor<f16, { [-1, -1, D] }>,
@@ -536,8 +521,7 @@ pub mod kernels {
 
     #[cutile::entry(print_ir=false,
                        optimization_hints = (
-                         tensor_dim_factor = 16,
-                         sm_120 = (occupancy=1,),
+                         sm_120 = (occupancy=1, max_divisibility=16,),
                        ))]
     fn kv_cache_update_seq_dynpos_f16<const D: i32, const BLOCK_SIZE: i32, const MAX_SEQ: i32>(
         new_k: &Tensor<f16, { [-1, -1, D] }>,
@@ -579,8 +563,7 @@ pub mod kernels {
     #[cutile::entry(print_ir=false,
                        unchecked_accesses=true,
                        optimization_hints = (
-                         tensor_dim_factor = 16,
-                         sm_120 = (occupancy=1,),
+                         sm_120 = (occupancy=1, max_divisibility=16,),
                        ))]
     unsafe fn flash_attn_f16<const BM: i32, const BN: i32, const D: i32>(
         q: &Tensor<f16, { [-1, -1, D] }>,
@@ -666,8 +649,7 @@ pub mod kernels {
     #[cutile::entry(print_ir=false,
                        unchecked_accesses=true,
                        optimization_hints = (
-                         tensor_dim_factor = 16,
-                         sm_120 = (occupancy=1,),
+                         sm_120 = (occupancy=1, max_divisibility=16,),
                        ))]
     unsafe fn flash_attn_causal_f16<const BM: i32, const BN: i32, const D: i32>(
         q: &Tensor<f16, { [-1, -1, D] }>,
@@ -763,8 +745,7 @@ pub mod kernels {
     #[cutile::entry(print_ir=false,
                        unchecked_accesses=true,
                        optimization_hints = (
-                         tensor_dim_factor = 16,
-                         sm_120 = (occupancy=1,),
+                         sm_120 = (occupancy=1, max_divisibility=16,),
                        ))]
     unsafe fn flash_attn_causal_seq_f16<const BM: i32, const BN: i32, const D: i32>(
         q: &Tensor<f16, { [-1, -1, D] }>,      // [q_len, q_heads, d]
@@ -964,10 +945,9 @@ pub mod kernels {
 
 #[allow(unused_imports)]
 pub use kernels::{
-    add_2d_f16_async, add_vec_f16_async, argmax_blocks_f16_async, embedding_batch_f16_async,
-    embedding_f16_async, flash_attn_causal_f16_async, flash_attn_causal_seq_dynpos_f16_async,
-    flash_attn_causal_seq_f16_async, flash_attn_f16_async, gather_row_f16_async, gemm_f16_async,
-    kv_cache_update_f16_async, kv_cache_update_seq_dynpos_f16_async, kv_cache_update_seq_f16_async,
-    rms_norm_f16_async, rope_f16_async, rope_seq_dynpos_f16_async, rope_seq_f16_async,
-    silu_mul_2d_f16_async, silu_mul_vec_f16_async,
+    add_2d_f16, add_vec_f16, argmax_blocks_f16, embedding_batch_f16, embedding_f16,
+    flash_attn_causal_f16, flash_attn_causal_seq_dynpos_f16, flash_attn_causal_seq_f16,
+    flash_attn_f16, gather_row_f16, gemm_f16, kv_cache_update_f16, kv_cache_update_seq_dynpos_f16,
+    kv_cache_update_seq_f16, rms_norm_f16, rope_f16, rope_seq_dynpos_f16, rope_seq_f16,
+    silu_mul_2d_f16, silu_mul_vec_f16,
 };

@@ -1,15 +1,15 @@
 use crate::config::SafetensorsIndex;
 use anyhow::{Context, Result, bail};
+use cutile::api;
+use cutile::api::DeviceOpReshape;
+use cutile::half::{bf16, f16};
+use cutile::tensor::Tensor;
 use memmap2::MmapOptions;
 use safetensors::{Dtype, SafeTensors};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use cutile::api;
-use cutile::api::DeviceOperationDynamicReshape;
-use cutile::half::{bf16, f16};
-use cutile::tensor::Tensor;
 
 #[derive(Debug)]
 pub struct HostTensor {
@@ -84,7 +84,7 @@ impl WeightLoader {
         let shape = host.shape.clone();
         let host_data = Arc::new(host.data);
         let device_tensor = api::copy_host_vec_to_device(&host_data)
-            .reshape_dyn(shape)
+            .reshape(&shape)
             .await?;
         Ok(Arc::new(device_tensor))
     }

@@ -2,16 +2,19 @@ use crate::config::{GenerationConfig, Qwen3Config};
 use crate::cublas;
 use crate::cuda_graph::CudaGraphExec;
 use crate::kernels::{
-    KernelKind, TILE_KERNEL_KINDS, add_2d_f16_async, argmax_blocks_f16_async,
-    embedding_batch_f16_async, flash_attn_causal_seq_dynpos_f16_async,
-    flash_attn_causal_seq_f16_async, gather_row_f16_async, kv_cache_update_seq_dynpos_f16_async,
-    kv_cache_update_seq_f16_async, rms_norm_f16_async, rope_seq_dynpos_f16_async,
-    rope_seq_f16_async, silu_mul_2d_f16_async,
+    KernelKind, TILE_KERNEL_KINDS, add_2d_f16, argmax_blocks_f16, embedding_batch_f16,
+    flash_attn_causal_seq_dynpos_f16, flash_attn_causal_seq_f16, gather_row_f16,
+    kv_cache_update_seq_dynpos_f16, kv_cache_update_seq_f16, rms_norm_f16, rope_seq_dynpos_f16,
+    rope_seq_f16, silu_mul_2d_f16,
 };
 use crate::loader::WeightLoader;
 use anyhow::{Context, Result, bail, ensure};
-use cuda_async::device_operation::{DeviceOperation, ExecutionContext, value, with_context};
+use cuda_async::device_operation::{DeviceOp, ExecutionContext, value, with_context};
 use cuda_core::memcpy_htod_async;
+use cutile::api;
+use cutile::half::f16;
+use cutile::tensor::{IntoPartition, IntoPartitionArc, Partition, Reshape, Tensor, ToHostVec};
+use cutile::tile_kernel::{PartitionOp, TileKernel};
 use rand::Rng;
 use std::cmp::{Reverse, min};
 use std::collections::HashMap;
@@ -20,10 +23,6 @@ use std::mem::size_of;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use cutile::api;
-use cutile::half::f16;
-use cutile::tensor::{IntoPartition, IntoPartitionArc, Partition, Tensor, ToHostVec};
-use cutile::tile_kernel::{IntoDeviceOperationPartition, TileKernel};
 use tokenizers::Tokenizer;
 
 const VEC_BLOCK: usize = 128;
@@ -68,13 +67,13 @@ impl DecodeCudaGraphRunner {
         self.position_host[0] = position_start as u32;
         unsafe {
             memcpy_htod_async(
-                self.token_ids_device.cu_deviceptr(),
+                self.token_ids_device.device_pointer().cu_deviceptr(),
                 self.token_host.as_ptr(),
                 1,
                 self.graph.stream(),
             );
             memcpy_htod_async(
-                self.position_device.cu_deviceptr(),
+                self.position_device.device_pointer().cu_deviceptr(),
                 self.position_host.as_ptr(),
                 1,
                 self.graph.stream(),
@@ -499,10 +498,10 @@ impl TensorPool {
         if let Some(bin) = self.free_exact.get_mut(spec)
             && let Some(t) = bin.pop()
         {
-            return Ok(t.reshape_dyn(&spec.shape));
+            return Ok(t.reshape(&spec.shape).unwrap());
         }
         if let Some(t) = self.take_compatible(spec) {
-            return Ok(t.reshape_dyn(&spec.shape));
+            return Ok(t.reshape(&spec.shape).unwrap());
         }
         if std::env::var("GROUT_DEBUG_POOL_ALLOC").ok().as_deref() == Some("1") {
             eprintln!(
@@ -514,18 +513,22 @@ impl TensorPool {
     }
 
     fn checkin(&mut self, tensor: Tensor<f16>, spec: &TensorSpec) -> Result<()> {
-        let numel = tensor.shape.iter().map(|d| *d as usize).product::<usize>();
+        let numel = tensor
+            .shape()
+            .iter()
+            .map(|d| *d as usize)
+            .product::<usize>();
         ensure!(
             numel == spec.numel(),
             "pool checkin numel mismatch: tensor shape {:?}, expected {:?}",
-            tensor.shape,
+            tensor.shape(),
             spec.shape
         );
 
         let cap = self.cache_caps.get(spec).copied().unwrap_or(usize::MAX);
         let bin = self.free_exact.entry(spec.clone()).or_default();
         if bin.len() < cap {
-            bin.push(tensor.reshape_dyn(&spec.shape));
+            bin.push(tensor.reshape(&spec.shape).unwrap());
         }
         Ok(())
     }
@@ -545,17 +548,7 @@ impl TensorPool {
 }
 
 fn alloc_f16_ctx(ctx: &ExecutionContext, shape: &[usize]) -> Result<Tensor<f16>> {
-    let out = match shape {
-        [d0] => unsafe { api::zeros::<1, f16>([*d0]).execute(ctx)? },
-        [d0, d1] => unsafe { api::zeros::<2, f16>([*d0, *d1]).execute(ctx)? },
-        [d0, d1, d2] => unsafe { api::zeros::<3, f16>([*d0, *d1, *d2]).execute(ctx)? },
-        _ => bail!(
-            "unsupported f16 tensor rank {} for shape {:?}",
-            shape.len(),
-            shape
-        ),
-    };
-    Ok(out)
+    Ok(unsafe { api::zeros::<f16>(shape).execute(ctx)? })
 }
 
 fn push_value(specs: &mut Vec<TensorSpec>, shape: Vec<usize>) -> ValueId {
@@ -882,9 +875,9 @@ impl Qwen3Engine {
             };
 
             let k_cache =
-                api::zeros::<3, f16>([cfg.num_key_value_heads, max_seq_len, cfg.head_dim]).await?;
+                api::zeros::<f16>(&[cfg.num_key_value_heads, max_seq_len, cfg.head_dim]).await?;
             let v_cache =
-                api::zeros::<3, f16>([cfg.num_key_value_heads, max_seq_len, cfg.head_dim]).await?;
+                api::zeros::<f16>(&[cfg.num_key_value_heads, max_seq_len, cfg.head_dim]).await?;
             layers.push(Layer {
                 weights,
                 state: LayerState {
@@ -956,7 +949,7 @@ impl Qwen3Engine {
         }
 
         self.reset_cache().await?;
-        with_context(|ctx| value(self.warm_tile_kernels_ctx(ctx))).await?;
+        let _ = with_context(|ctx| value(self.warm_tile_kernels_ctx(ctx))).await?;
 
         self.reset_cache().await?;
         Ok(())
@@ -974,23 +967,23 @@ impl Qwen3Engine {
     }
 
     fn warm_decode_graph_kernels_ctx(&mut self, ctx: &ExecutionContext) -> Result<()> {
-        let pos = Arc::new(unsafe { api::zeros::<1, u32>([1]).execute(ctx)? });
+        let pos = Arc::new(unsafe { api::zeros::<u32>(&[1]).execute(ctx)? });
         let x = Arc::new(unsafe {
-            api::zeros::<3, f16>([1, self.cfg.num_attention_heads, self.cfg.head_dim]).execute(ctx)?
+            api::zeros::<f16>(&[1, self.cfg.num_attention_heads, self.cfg.head_dim]).execute(ctx)?
         });
         let x_out = alloc_f16_ctx(ctx, &[1, self.cfg.num_attention_heads, self.cfg.head_dim])?;
         let _ = self.rope_seq_arc_into_ctx_device_pos(ctx, x, pos.clone(), x_out)?;
 
         let new_k = Arc::new(unsafe {
-            api::zeros::<3, f16>([1, self.cfg.num_key_value_heads, self.cfg.head_dim]).execute(ctx)?
+            api::zeros::<f16>(&[1, self.cfg.num_key_value_heads, self.cfg.head_dim]).execute(ctx)?
         });
         let new_v = Arc::new(unsafe {
-            api::zeros::<3, f16>([1, self.cfg.num_key_value_heads, self.cfg.head_dim]).execute(ctx)?
+            api::zeros::<f16>(&[1, self.cfg.num_key_value_heads, self.cfg.head_dim]).execute(ctx)?
         });
         self.kv_cache_update_seq_arc_ctx_device_pos(ctx, 0, new_k, new_v, pos.clone())?;
 
         let q = Arc::new(unsafe {
-            api::zeros::<3, f16>([1, self.cfg.num_attention_heads, self.cfg.head_dim]).execute(ctx)?
+            api::zeros::<f16>(&[1, self.cfg.num_attention_heads, self.cfg.head_dim]).execute(ctx)?
         });
         let q_out = alloc_f16_ctx(ctx, &[1, self.cfg.num_attention_heads, self.cfg.head_dim])?;
         let _ = self.attend_seq_arc_into_ctx_device_pos(ctx, 0, q, pos, q_out)?;
@@ -1015,39 +1008,38 @@ impl Qwen3Engine {
                 let _ = self.embedding_batch_ctx(ctx, &warm_ids)?;
             }
             KernelKind::Gemm => {
-                let x = unsafe { api::zeros::<2, f16>([1, self.cfg.hidden_size]).execute(ctx)? };
+                let x = unsafe { api::zeros::<f16>(&[1, self.cfg.hidden_size]).execute(ctx)? };
                 let x = Arc::new(x);
                 let q_proj = self.layers[0].weights.q_proj.clone();
                 let _ = self.gemm_ctx(ctx, q_proj, x)?;
             }
             KernelKind::Gemv => {
-                let v = unsafe { api::zeros::<1, f16>([self.cfg.hidden_size]).execute(ctx)? };
+                let v = unsafe { api::zeros::<f16>(&[self.cfg.hidden_size]).execute(ctx)? };
                 let v = Arc::new(v);
                 let _ = self.gemv_ctx(ctx, self.embed_tokens.clone(), v)?;
             }
             KernelKind::RmsNorm => {
-                let hidden =
-                    unsafe { api::zeros::<2, f16>([1, self.cfg.hidden_size]).execute(ctx)? };
+                let hidden = unsafe { api::zeros::<f16>(&[1, self.cfg.hidden_size]).execute(ctx)? };
                 let _ = self.rms_norm_ctx(ctx, hidden, self.norm.clone(), self.cfg.hidden_size)?;
 
                 let q_norm = self.layers[0].weights.q_norm.clone();
-                let head = unsafe { api::zeros::<2, f16>([1, self.cfg.head_dim]).execute(ctx)? };
+                let head = unsafe { api::zeros::<f16>(&[1, self.cfg.head_dim]).execute(ctx)? };
                 let _ = self.rms_norm_ctx(ctx, head, q_norm, self.cfg.head_dim)?;
             }
             KernelKind::RopeSeq => {
                 let q = unsafe {
-                    api::zeros::<3, f16>([1, self.cfg.num_attention_heads, self.cfg.head_dim])
+                    api::zeros::<f16>(&[1, self.cfg.num_attention_heads, self.cfg.head_dim])
                         .execute(ctx)?
                 };
                 let _ = self.rope_seq_ctx(ctx, q, 0)?;
             }
             KernelKind::KvCacheUpdateSeq => {
                 let new_k = unsafe {
-                    api::zeros::<3, f16>([1, self.cfg.num_key_value_heads, self.cfg.head_dim])
+                    api::zeros::<f16>(&[1, self.cfg.num_key_value_heads, self.cfg.head_dim])
                         .execute(ctx)?
                 };
                 let new_v = unsafe {
-                    api::zeros::<3, f16>([1, self.cfg.num_key_value_heads, self.cfg.head_dim])
+                    api::zeros::<f16>(&[1, self.cfg.num_key_value_heads, self.cfg.head_dim])
                         .execute(ctx)?
                 };
                 self.kv_cache_update_seq_ctx(ctx, 0, new_k, new_v, 0)?;
@@ -1059,43 +1051,39 @@ impl Qwen3Engine {
                         continue;
                     }
                     let q = unsafe {
-                        api::zeros::<3, f16>([
-                            q_len,
-                            self.cfg.num_attention_heads,
-                            self.cfg.head_dim,
-                        ])
-                        .execute(ctx)?
+                        api::zeros::<f16>(&[q_len, self.cfg.num_attention_heads, self.cfg.head_dim])
+                            .execute(ctx)?
                     };
                     let _ = self.attend_seq_ctx(ctx, 0, q, 0)?;
                 }
             }
             KernelKind::AddVec => {
                 let lhs = Arc::new(unsafe {
-                    api::zeros::<2, f16>([1, self.cfg.hidden_size]).execute(ctx)?
+                    api::zeros::<f16>(&[1, self.cfg.hidden_size]).execute(ctx)?
                 });
                 let rhs = Arc::new(unsafe {
-                    api::zeros::<2, f16>([1, self.cfg.hidden_size]).execute(ctx)?
+                    api::zeros::<f16>(&[1, self.cfg.hidden_size]).execute(ctx)?
                 });
                 let _ = self.add_2d_ctx(ctx, lhs, rhs)?;
             }
             KernelKind::SiluMul => {
                 let gate = Arc::new(unsafe {
-                    api::zeros::<2, f16>([1, self.cfg.intermediate_size]).execute(ctx)?
+                    api::zeros::<f16>(&[1, self.cfg.intermediate_size]).execute(ctx)?
                 });
                 let up = Arc::new(unsafe {
-                    api::zeros::<2, f16>([1, self.cfg.intermediate_size]).execute(ctx)?
+                    api::zeros::<f16>(&[1, self.cfg.intermediate_size]).execute(ctx)?
                 });
                 let _ = self.silu_mul_2d_ctx(ctx, gate, up)?;
             }
             KernelKind::GatherRow => {
                 let src = Arc::new(unsafe {
-                    api::zeros::<2, f16>([1, self.cfg.hidden_size]).execute(ctx)?
+                    api::zeros::<f16>(&[1, self.cfg.hidden_size]).execute(ctx)?
                 });
                 let _ = self.gather_row_ctx(ctx, src, 0)?;
             }
             KernelKind::ArgmaxBlocks => {
                 let logits =
-                    Arc::new(unsafe { api::zeros::<1, f16>([self.cfg.vocab_size]).execute(ctx)? });
+                    Arc::new(unsafe { api::zeros::<f16>(&[self.cfg.vocab_size]).execute(ctx)? });
                 let _ = self.argmax_blocks_ctx(ctx, logits, self.cfg.vocab_size)?;
             }
         }
@@ -1107,7 +1095,7 @@ impl Qwen3Engine {
     pub async fn reset_cache(&mut self) -> Result<()> {
         for layer in &mut self.layers {
             layer.state.k_cache = Some(Arc::new(
-                api::zeros::<3, f16>([
+                api::zeros::<f16>(&[
                     self.cfg.num_key_value_heads,
                     self.max_seq_len,
                     self.cfg.head_dim,
@@ -1115,7 +1103,7 @@ impl Qwen3Engine {
                 .await?,
             ));
             layer.state.v_cache = Some(Arc::new(
-                api::zeros::<3, f16>([
+                api::zeros::<f16>(&[
                     self.cfg.num_key_value_heads,
                     self.max_seq_len,
                     self.cfg.head_dim,
@@ -1390,7 +1378,7 @@ impl Qwen3Engine {
         ctx: &ExecutionContext,
         position_start: usize,
     ) -> Result<DecodeCudaGraphRunner> {
-        cuda_async::device_context::with_global_device_context(ctx.get_device_id(), |_| ());
+        let _ = cuda_async::device_context::with_global_device_context(ctx.get_device_id(), |_| ());
         ensure!(
             position_start <= u32::MAX as usize,
             "position_start {} exceeds u32 range",
@@ -1496,10 +1484,10 @@ impl Qwen3Engine {
         for layer_idx in 0..self.cfg.num_hidden_layers {
             let o_proj = &self.layers[layer_idx].weights.o_proj;
             ensure!(
-                o_proj.shape.len() == 2 && o_proj.shape[1] as usize == attn_width,
+                o_proj.shape().len() == 2 && o_proj.shape()[1] as usize == attn_width,
                 "o_proj expected input dim {}, got shape {:?}",
                 attn_width,
-                o_proj.shape
+                o_proj.shape()
             );
 
             let normed = push_value(&mut specs, vec![seqlen, hidden_size]);
@@ -1842,7 +1830,7 @@ impl Qwen3Engine {
                             .cloned()
                             .context("missing reshape input value")?
                     };
-                    let reshaped = self.take_or_copy_f16_ctx(ctx, src)?.reshape_dyn(shape);
+                    let reshaped = self.take_or_copy_f16_ctx(ctx, src)?.reshape(shape).unwrap();
                     values[out.idx()] = Some(Arc::new(reshaped));
                 }
                 GraphOp::Rope { x, out } => {
@@ -2078,10 +2066,14 @@ impl Qwen3Engine {
     }
 
     fn copy_f16_ctx(&self, ctx: &ExecutionContext, src: &Arc<Tensor<f16>>) -> Result<Tensor<f16>> {
-        Ok(unsafe { api::copy(src).execute(ctx)? })
+        Ok(unsafe { api::dup(src).execute(ctx)? })
     }
 
-    fn take_or_copy_f16_ctx(&self, ctx: &ExecutionContext, src: Arc<Tensor<f16>>) -> Result<Tensor<f16>> {
+    fn take_or_copy_f16_ctx(
+        &self,
+        ctx: &ExecutionContext,
+        src: Arc<Tensor<f16>>,
+    ) -> Result<Tensor<f16>> {
         match Arc::try_unwrap(src) {
             Ok(t) => Ok(t),
             Err(shared) => self.copy_f16_ctx(ctx, &shared),
@@ -2113,16 +2105,16 @@ impl Qwen3Engine {
         );
         let seqlen = token_ids.len();
         ensure!(
-            out.shape == vec![seqlen as i32, self.cfg.hidden_size as i32],
+            out.shape() == [seqlen as i32, self.cfg.hidden_size as i32],
             "embedding output shape mismatch, got {:?}",
-            out.shape
+            out.shape()
         );
 
         let ids_host = Arc::new(token_ids.to_vec());
         let ids = unsafe { api::copy_host_vec_to_device(&ids_host).execute(ctx)? };
-        let out = out.partition([1, VEC_BLOCK as i32]);
+        let out = out.partition([1, VEC_BLOCK]);
         let result = unsafe {
-            embedding_batch_f16_async(
+            embedding_batch_f16(
                 value(Arc::new(ids)),
                 value(self.embed_tokens.clone()),
                 value(out),
@@ -2145,24 +2137,24 @@ impl Qwen3Engine {
         out: Tensor<f16>,
     ) -> Result<Tensor<f16>> {
         ensure!(
-            token_ids.shape.len() == 1,
+            token_ids.shape().len() == 1,
             "embedding token_ids must be rank-1, got {:?}",
-            token_ids.shape
+            token_ids.shape()
         );
-        let seqlen = token_ids.shape[0] as usize;
+        let seqlen = token_ids.shape()[0] as usize;
         ensure!(
             seqlen > 0,
             "embedding token_ids must contain at least one token"
         );
         ensure!(
-            out.shape == vec![seqlen as i32, self.cfg.hidden_size as i32],
+            out.shape() == [seqlen as i32, self.cfg.hidden_size as i32],
             "embedding output shape mismatch, got {:?}",
-            out.shape
+            out.shape()
         );
 
-        let out = out.partition([1, VEC_BLOCK as i32]);
+        let out = out.partition([1, VEC_BLOCK]);
         let result = unsafe {
-            embedding_batch_f16_async(
+            embedding_batch_f16(
                 value(token_ids),
                 value(self.embed_tokens.clone()),
                 value(out),
@@ -2184,11 +2176,11 @@ impl Qwen3Engine {
         vector: Arc<Tensor<f16>>,
     ) -> Result<Tensor<f16>> {
         ensure!(
-            matrix.shape.len() == 2,
+            matrix.shape().len() == 2,
             "gemv matrix must be rank 2, got {:?}",
-            matrix.shape
+            matrix.shape()
         );
-        let m = matrix.shape[0] as usize;
+        let m = matrix.shape()[0] as usize;
         let out = alloc_f16_ctx(ctx, &[m])?;
         self.gemv_into_ctx(ctx, matrix, vector, out)
     }
@@ -2201,23 +2193,23 @@ impl Qwen3Engine {
         out: Tensor<f16>,
     ) -> Result<Tensor<f16>> {
         ensure!(
-            matrix.shape.len() == 2,
+            matrix.shape().len() == 2,
             "gemv matrix must be rank 2, got {:?}",
-            matrix.shape
+            matrix.shape()
         );
         ensure!(
-            vector.shape.len() == 1,
+            vector.shape().len() == 1,
             "gemv vector must be rank 1, got {:?}",
-            vector.shape
+            vector.shape()
         );
 
-        let m = matrix.shape[0] as usize;
-        let k = matrix.shape[1] as usize;
-        ensure!(k == vector.shape[0] as usize, "gemv shape mismatch");
+        let m = matrix.shape()[0] as usize;
+        let k = matrix.shape()[1] as usize;
+        ensure!(k == vector.shape()[0] as usize, "gemv shape mismatch");
         ensure!(
-            out.shape == vec![m as i32],
+            out.shape() == [m as i32],
             "gemv output shape mismatch, got {:?}",
-            out.shape
+            out.shape()
         );
         let op = cublas::gemv_f16_op(matrix, vector, out, m, k)?;
         unsafe { op.execute(ctx)? }
@@ -2230,17 +2222,17 @@ impl Qwen3Engine {
         rhs: Arc<Tensor<f16>>,
     ) -> Result<Tensor<f16>> {
         ensure!(
-            matrix.shape.len() == 2,
+            matrix.shape().len() == 2,
             "gemm matrix must be rank 2, got {:?}",
-            matrix.shape
+            matrix.shape()
         );
         ensure!(
-            rhs.shape.len() == 2,
+            rhs.shape().len() == 2,
             "gemm rhs must be rank 2, got {:?}",
-            rhs.shape
+            rhs.shape()
         );
-        let m = matrix.shape[0] as usize;
-        let n = rhs.shape[0] as usize;
+        let m = matrix.shape()[0] as usize;
+        let n = rhs.shape()[0] as usize;
         let out = alloc_f16_ctx(ctx, &[n, m])?;
         self.gemm_into_ctx(ctx, matrix, rhs, out)
     }
@@ -2253,23 +2245,23 @@ impl Qwen3Engine {
         out: Tensor<f16>,
     ) -> Result<Tensor<f16>> {
         ensure!(
-            matrix.shape.len() == 2,
+            matrix.shape().len() == 2,
             "gemm matrix must be rank 2, got {:?}",
-            matrix.shape
+            matrix.shape()
         );
         ensure!(
-            rhs.shape.len() == 2,
+            rhs.shape().len() == 2,
             "gemm rhs must be rank 2, got {:?}",
-            rhs.shape
+            rhs.shape()
         );
-        let m = matrix.shape[0] as usize;
-        let k = matrix.shape[1] as usize;
-        let n = rhs.shape[0] as usize;
-        ensure!(k == rhs.shape[1] as usize, "gemm shape mismatch");
+        let m = matrix.shape()[0] as usize;
+        let k = matrix.shape()[1] as usize;
+        let n = rhs.shape()[0] as usize;
+        ensure!(k == rhs.shape()[1] as usize, "gemm shape mismatch");
         ensure!(
-            out.shape == vec![n as i32, m as i32],
+            out.shape() == [n as i32, m as i32],
             "gemm output shape mismatch, got {:?}",
-            out.shape
+            out.shape()
         );
         let op = cublas::gemm_f16_op(matrix, rhs, out, m, n, k)?;
         unsafe { op.execute(ctx)? }
@@ -2281,8 +2273,8 @@ impl Qwen3Engine {
         lhs: Arc<Tensor<f16>>,
         rhs: Arc<Tensor<f16>>,
     ) -> Result<Tensor<f16>> {
-        let rows = lhs.shape[0] as usize;
-        let cols = lhs.shape[1] as usize;
+        let rows = lhs.shape()[0] as usize;
+        let cols = lhs.shape()[1] as usize;
         let out = alloc_f16_ctx(ctx, &[rows, cols])?;
         self.add_2d_into_ctx(ctx, lhs, rhs, out)
     }
@@ -2294,22 +2286,22 @@ impl Qwen3Engine {
         rhs: Arc<Tensor<f16>>,
         out: Tensor<f16>,
     ) -> Result<Tensor<f16>> {
-        ensure!(lhs.shape == rhs.shape, "add shape mismatch");
-        ensure!(lhs.shape.len() == 2, "add_2d expects rank-2 tensors");
-        let rows = lhs.shape[0] as usize;
-        let cols = lhs.shape[1] as usize;
+        ensure!(lhs.shape() == rhs.shape(), "add shape mismatch");
+        ensure!(lhs.shape().len() == 2, "add_2d expects rank-2 tensors");
+        let rows = lhs.shape()[0] as usize;
+        let cols = lhs.shape()[1] as usize;
         ensure!(
             cols.is_multiple_of(POINTWISE_BLOCK),
             "add cols {cols} not divisible by {POINTWISE_BLOCK}"
         );
         ensure!(
-            out.shape == vec![rows as i32, cols as i32],
+            out.shape() == [rows as i32, cols as i32],
             "add output shape mismatch, got {:?}",
-            out.shape
+            out.shape()
         );
-        let out = out.partition([1, POINTWISE_BLOCK as i32]);
+        let out = out.partition([1, POINTWISE_BLOCK]);
         let result = unsafe {
-            add_2d_f16_async(value(out), value(lhs), value(rhs))
+            add_2d_f16(value(out), value(lhs), value(rhs))
                 .generics(vec![POINTWISE_BLOCK.to_string()])
                 .execute(ctx)?
         };
@@ -2323,8 +2315,8 @@ impl Qwen3Engine {
         gate: Arc<Tensor<f16>>,
         up: Arc<Tensor<f16>>,
     ) -> Result<Tensor<f16>> {
-        let rows = gate.shape[0] as usize;
-        let cols = gate.shape[1] as usize;
+        let rows = gate.shape()[0] as usize;
+        let cols = gate.shape()[1] as usize;
         let out = alloc_f16_ctx(ctx, &[rows, cols])?;
         self.silu_mul_2d_into_ctx(ctx, gate, up, out)
     }
@@ -2336,22 +2328,22 @@ impl Qwen3Engine {
         up: Arc<Tensor<f16>>,
         out: Tensor<f16>,
     ) -> Result<Tensor<f16>> {
-        ensure!(gate.shape == up.shape, "silu_mul shape mismatch");
-        ensure!(gate.shape.len() == 2, "silu_mul expects rank-2 tensors");
-        let rows = gate.shape[0] as usize;
-        let cols = gate.shape[1] as usize;
+        ensure!(gate.shape() == up.shape(), "silu_mul shape mismatch");
+        ensure!(gate.shape().len() == 2, "silu_mul expects rank-2 tensors");
+        let rows = gate.shape()[0] as usize;
+        let cols = gate.shape()[1] as usize;
         ensure!(
             cols.is_multiple_of(POINTWISE_BLOCK),
             "silu_mul cols {cols} not divisible by {POINTWISE_BLOCK}"
         );
         ensure!(
-            out.shape == vec![rows as i32, cols as i32],
+            out.shape() == [rows as i32, cols as i32],
             "silu_mul output shape mismatch, got {:?}",
-            out.shape
+            out.shape()
         );
-        let out = out.partition([1, POINTWISE_BLOCK as i32]);
+        let out = out.partition([1, POINTWISE_BLOCK]);
         let result = unsafe {
-            silu_mul_2d_f16_async(value(out), value(gate), value(up))
+            silu_mul_2d_f16(value(out), value(gate), value(up))
                 .generics(vec![POINTWISE_BLOCK.to_string()])
                 .execute(ctx)?
         };
@@ -2366,7 +2358,7 @@ impl Qwen3Engine {
         weight: Arc<Tensor<f16>>,
         n: usize,
     ) -> Result<Tensor<f16>> {
-        let x_shape: Vec<usize> = x.shape.iter().map(|d| *d as usize).collect();
+        let x_shape: Vec<usize> = x.shape().iter().map(|d| *d as usize).collect();
         let rows = match x_shape.as_slice() {
             [d] => {
                 ensure!(*d == n, "rms_norm expected dim {n}, got {d}");
@@ -2397,11 +2389,14 @@ impl Qwen3Engine {
             n.is_multiple_of(RMS_BLOCK),
             "rms_norm n={n} must be divisible by {RMS_BLOCK}"
         );
-        let orig_shape: Vec<usize> = x.shape.iter().map(|d| *d as usize).collect();
+        let orig_shape: Vec<usize> = x.shape().iter().map(|d| *d as usize).collect();
         let (x, rows) = match orig_shape.as_slice() {
             [d] => {
                 ensure!(*d == n, "rms_norm expected dim {n}, got {d}");
-                (Arc::new(self.copy_f16_ctx(ctx, &x)?.reshape([1, n])), 1)
+                (
+                    Arc::new(self.copy_f16_ctx(ctx, &x)?.reshape(&[1, n]).unwrap()),
+                    1,
+                )
             }
             [r, d] => {
                 ensure!(*d == n, "rms_norm expected inner dim {n}, got {d}");
@@ -2414,13 +2409,13 @@ impl Qwen3Engine {
         };
 
         ensure!(
-            out.shape.iter().map(|d| *d as usize).product::<usize>() == rows * n,
+            out.shape().iter().map(|d| *d as usize).product::<usize>() == rows * n,
             "rms_norm output numel mismatch, got {:?}",
-            out.shape
+            out.shape()
         );
-        let out = out.reshape([rows, n]).partition([1, n as i32]);
+        let out = out.reshape(&[rows, n]).unwrap().partition([1, n]);
         let result = unsafe {
-            rms_norm_f16_async(
+            rms_norm_f16(
                 value(x),
                 value(weight),
                 value(out),
@@ -2431,7 +2426,7 @@ impl Qwen3Engine {
         };
         let _x: Arc<Tensor<f16>> = result.0;
         let out: Partition<Tensor<f16>> = result.2;
-        Ok(out.unpartition().reshape_dyn(&orig_shape))
+        Ok(out.unpartition().reshape(&orig_shape).unwrap())
     }
 
     fn rope_seq_ctx(
@@ -2441,14 +2436,14 @@ impl Qwen3Engine {
         position_start: usize,
     ) -> Result<Tensor<f16>> {
         ensure!(
-            x.shape.len() == 3
-                && x.shape[2] as usize == self.cfg.head_dim
-                && x.shape[2] as usize == ROPE_BLOCK,
+            x.shape().len() == 3
+                && x.shape()[2] as usize == self.cfg.head_dim
+                && x.shape()[2] as usize == ROPE_BLOCK,
             "rope expects [seqlen, heads, head_dim] where head_dim={ROPE_BLOCK}, got {:?}",
-            x.shape
+            x.shape()
         );
-        let seq_len = x.shape[0] as usize;
-        let num_heads = x.shape[1] as usize;
+        let seq_len = x.shape()[0] as usize;
+        let num_heads = x.shape()[1] as usize;
         let out = alloc_f16_ctx(ctx, &[seq_len, num_heads, self.cfg.head_dim])?;
         self.rope_seq_arc_into_ctx(ctx, Arc::new(x), position_start, out)
     }
@@ -2483,31 +2478,31 @@ impl Qwen3Engine {
         out: Tensor<f16>,
     ) -> Result<Tensor<f16>> {
         ensure!(
-            x.shape.len() == 3
-                && x.shape[2] as usize == self.cfg.head_dim
-                && x.shape[2] as usize == ROPE_BLOCK,
+            x.shape().len() == 3
+                && x.shape()[2] as usize == self.cfg.head_dim
+                && x.shape()[2] as usize == ROPE_BLOCK,
             "rope expects [seqlen, heads, head_dim] where head_dim={ROPE_BLOCK}, got {:?}",
-            x.shape
+            x.shape()
         );
         if let PositionInput::Device(position_start) = position_input {
             ensure!(
-                position_start.shape == vec![1],
+                position_start.shape() == [1],
                 "rope position tensor must be shape [1], got {:?}",
-                position_start.shape
+                position_start.shape()
             );
         }
-        let seq_len = x.shape[0] as usize;
-        let num_heads = x.shape[1] as usize;
+        let seq_len = x.shape()[0] as usize;
+        let num_heads = x.shape()[1] as usize;
         ensure!(
-            out.shape == vec![seq_len as i32, num_heads as i32, self.cfg.head_dim as i32],
+            out.shape() == [seq_len as i32, num_heads as i32, self.cfg.head_dim as i32],
             "rope output shape mismatch, got {:?}",
-            out.shape
+            out.shape()
         );
-        let out = out.partition([1, 1, (self.cfg.head_dim / 2) as i32]);
+        let out = out.partition([1, 1, self.cfg.head_dim / 2]);
         let out: Partition<Tensor<f16>> = match position_input {
             PositionInput::Host(position_start) => {
                 let result = unsafe {
-                    rope_seq_f16_async(
+                    rope_seq_f16(
                         value(x),
                         value(self.inv_freq.clone()),
                         value(out),
@@ -2523,7 +2518,7 @@ impl Qwen3Engine {
             }
             PositionInput::Device(position_start) => {
                 let result = unsafe {
-                    rope_seq_dynpos_f16_async(
+                    rope_seq_dynpos_f16(
                         value(x),
                         value(self.inv_freq.clone()),
                         value(position_start.clone()),
@@ -2603,30 +2598,30 @@ impl Qwen3Engine {
         position_input: &PositionInput,
     ) -> Result<()> {
         ensure!(
-            new_k.shape.len() == 3,
+            new_k.shape().len() == 3,
             "new_k must be rank 3 [seqlen, kv_heads, head_dim], got {:?}",
-            new_k.shape
+            new_k.shape()
         );
-        let seq_len = new_k.shape[0] as usize;
+        let seq_len = new_k.shape()[0] as usize;
         ensure!(
-            new_k.shape
-                == vec![
+            new_k.shape()
+                == [
                     seq_len as i32,
                     self.cfg.num_key_value_heads as i32,
                     self.cfg.head_dim as i32
                 ],
             "new_k shape mismatch: {:?}",
-            new_k.shape
+            new_k.shape()
         );
         ensure!(
-            new_v.shape
-                == vec![
+            new_v.shape()
+                == [
                     seq_len as i32,
                     self.cfg.num_key_value_heads as i32,
                     self.cfg.head_dim as i32
                 ],
             "new_v shape mismatch: {:?}",
-            new_v.shape
+            new_v.shape()
         );
         ensure!(
             self.cfg.head_dim.is_multiple_of(VEC_BLOCK),
@@ -2646,9 +2641,9 @@ impl Qwen3Engine {
                     "decode graph path expects seq_len=1, got {seq_len}"
                 );
                 ensure!(
-                    position_start.shape == vec![1],
+                    position_start.shape() == [1],
                     "kv_cache position tensor must be shape [1], got {:?}",
-                    position_start.shape
+                    position_start.shape()
                 );
             }
         }
@@ -2664,13 +2659,13 @@ impl Qwen3Engine {
             .v_cache
             .take()
             .context("missing v_cache in layer state")?;
-        let k_cache_part = k_cache.partition([1, self.max_seq_len as i32, VEC_BLOCK as i32]);
-        let v_cache_part = v_cache.partition([1, self.max_seq_len as i32, VEC_BLOCK as i32]);
+        let k_cache_part = k_cache.partition([1, self.max_seq_len, VEC_BLOCK]);
+        let v_cache_part = v_cache.partition([1, self.max_seq_len, VEC_BLOCK]);
         let (k_cache, v_cache): (Partition<Tensor<f16>>, Partition<Tensor<f16>>) =
             match position_input {
                 PositionInput::Host(position_start) => {
                     let result = unsafe {
-                        kv_cache_update_seq_f16_async(
+                        kv_cache_update_seq_f16(
                             value(new_k),
                             value(new_v),
                             value(k_cache_part),
@@ -2689,7 +2684,7 @@ impl Qwen3Engine {
                 }
                 PositionInput::Device(position_start) => {
                     let result = unsafe {
-                        kv_cache_update_seq_dynpos_f16_async(
+                        kv_cache_update_seq_dynpos_f16(
                             value(new_k),
                             value(new_v),
                             value(k_cache_part),
@@ -2720,11 +2715,11 @@ impl Qwen3Engine {
         position_start: usize,
     ) -> Result<Tensor<f16>> {
         ensure!(
-            q.shape.len() == 3,
+            q.shape().len() == 3,
             "q must be rank 3 [seqlen, heads, head_dim], got {:?}",
-            q.shape
+            q.shape()
         );
-        let q_len = q.shape[0] as usize;
+        let q_len = q.shape()[0] as usize;
         let out = alloc_f16_ctx(
             ctx,
             &[q_len, self.cfg.num_attention_heads, self.cfg.head_dim],
@@ -2765,27 +2760,27 @@ impl Qwen3Engine {
         out: Tensor<f16>,
     ) -> Result<Tensor<f16>> {
         ensure!(
-            q.shape.len() == 3,
+            q.shape().len() == 3,
             "q must be rank 3 [seqlen, heads, head_dim], got {:?}",
-            q.shape
+            q.shape()
         );
-        let q_len = q.shape[0] as usize;
+        let q_len = q.shape()[0] as usize;
         ensure!(
-            q.shape
-                == vec![
+            q.shape()
+                == [
                     q_len as i32,
                     self.cfg.num_attention_heads as i32,
                     self.cfg.head_dim as i32
                 ],
             "q shape mismatch in attend: {:?}",
-            q.shape
+            q.shape()
         );
         if let PositionInput::Device(position_start) = position_input {
             ensure!(q_len == 1, "decode graph path expects q_len=1, got {q_len}");
             ensure!(
-                position_start.shape == vec![1],
+                position_start.shape() == [1],
                 "attention position tensor must be shape [1], got {:?}",
-                position_start.shape
+                position_start.shape()
             );
         }
 
@@ -2814,21 +2809,21 @@ impl Qwen3Engine {
             PositionInput::Device(_) => env_usize_or("GROUT_ATTN_BN_DECODE", ATTN_BN_DECODE),
         };
         ensure!(
-            out.shape
-                == vec![
+            out.shape()
+                == [
                     q_len as i32,
                     self.cfg.num_attention_heads as i32,
                     self.cfg.head_dim as i32
                 ],
             "attend output shape mismatch, got {:?}",
-            out.shape
+            out.shape()
         );
-        let out = out.partition([1, 1, self.cfg.head_dim as i32]);
+        let out = out.partition([1, 1, self.cfg.head_dim]);
         let out: Partition<Tensor<f16>> = match position_input {
             PositionInput::Host(position_start) => {
                 let kv_len = (*position_start + q_len) as i32;
                 let result = unsafe {
-                    flash_attn_causal_seq_f16_async(
+                    flash_attn_causal_seq_f16(
                         value(q.clone()),
                         value(k_cache.clone()),
                         value(v_cache.clone()),
@@ -2849,7 +2844,7 @@ impl Qwen3Engine {
             }
             PositionInput::Device(position_start) => {
                 let result = unsafe {
-                    flash_attn_causal_seq_dynpos_f16_async(
+                    flash_attn_causal_seq_dynpos_f16(
                         value(q.clone()),
                         value(k_cache.clone()),
                         value(v_cache.clone()),
@@ -2877,8 +2872,8 @@ impl Qwen3Engine {
         src: Arc<Tensor<f16>>,
         row_idx: usize,
     ) -> Result<Tensor<f16>> {
-        ensure!(src.shape.len() == 2, "gather_row expects rank-2 tensor");
-        let cols = src.shape[1] as usize;
+        ensure!(src.shape().len() == 2, "gather_row expects rank-2 tensor");
+        let cols = src.shape()[1] as usize;
         let out = alloc_f16_ctx(ctx, &[cols])?;
         self.gather_row_into_ctx(ctx, src, row_idx, out)
     }
@@ -2890,22 +2885,22 @@ impl Qwen3Engine {
         row_idx: usize,
         out: Tensor<f16>,
     ) -> Result<Tensor<f16>> {
-        ensure!(src.shape.len() == 2, "gather_row expects rank-2 tensor");
-        let rows = src.shape[0] as usize;
-        let cols = src.shape[1] as usize;
+        ensure!(src.shape().len() == 2, "gather_row expects rank-2 tensor");
+        let rows = src.shape()[0] as usize;
+        let cols = src.shape()[1] as usize;
         ensure!(row_idx < rows, "row_idx {} out of bounds {}", row_idx, rows);
         ensure!(
             cols.is_multiple_of(VEC_BLOCK),
             "gather_row cols {cols} not divisible by {VEC_BLOCK}"
         );
         ensure!(
-            out.shape == vec![cols as i32],
+            out.shape() == [cols as i32],
             "gather_row output shape mismatch, got {:?}",
-            out.shape
+            out.shape()
         );
-        let out = out.partition([VEC_BLOCK as i32]);
+        let out = out.partition([VEC_BLOCK]);
         let result = unsafe {
-            gather_row_f16_async(value(src), value(out), value(row_idx as i32))
+            gather_row_f16(value(src), value(out), value(row_idx as i32))
                 .generics(vec![VEC_BLOCK.to_string()])
                 .execute(ctx)?
         };
@@ -2926,10 +2921,10 @@ impl Qwen3Engine {
         );
 
         let num_blocks = len / ARGMAX_BLOCK;
-        let block_max = api::zeros::<1, f32>([num_blocks]).partition([1]);
-        let block_idx = api::zeros::<1, u32>([num_blocks]).partition([1]);
+        let block_max = api::zeros::<f32>(&[num_blocks]).partition([1]);
+        let block_idx = api::zeros::<u32>(&[num_blocks]).partition([1]);
         let result = unsafe {
-            argmax_blocks_f16_async(value(logits), block_max, block_idx, value(len as i32))
+            argmax_blocks_f16(value(logits), block_max, block_idx, value(len as i32))
                 .generics(vec![ARGMAX_BLOCK.to_string()])
                 .execute(ctx)?
         };
@@ -2940,11 +2935,11 @@ impl Qwen3Engine {
 
     async fn argmax_device(&self, logits: Arc<Tensor<f16>>) -> Result<usize> {
         ensure!(
-            logits.shape.len() == 1,
+            logits.shape().len() == 1,
             "argmax expects rank-1 logits, got {:?}",
-            logits.shape
+            logits.shape()
         );
-        let len = logits.shape[0] as usize;
+        let len = logits.shape()[0] as usize;
         ensure!(len > 0, "argmax expects non-empty logits");
         if !len.is_multiple_of(ARGMAX_BLOCK) {
             let host = logits.to_host_vec().await?;
