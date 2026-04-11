@@ -1,13 +1,13 @@
 use anyhow::{Result, anyhow, ensure};
-use cuda_async::device_operation::{DeviceOperation, value, with_context};
-use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
+use cuda_async::device_operation::{DeviceOp, value, with_context};
 use cuda_core::{IntoResult, sys as cu_sys};
+use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
+use cutile::half::f16;
+use cutile::tensor::Tensor;
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::mem::{MaybeUninit, size_of};
 use std::sync::Arc;
-use cutile::half::f16;
-use cutile::tensor::Tensor;
 
 type CublasHandle = usize;
 type StreamKey = (usize, usize);
@@ -235,14 +235,14 @@ unsafe fn launch_gemm_f16(
             n,
             k,
             alpha_ptr,
-            matrix.cu_deviceptr() as usize as *const c_void,
+            matrix.device_pointer().cu_deviceptr() as usize as *const c_void,
             cublas_sys::cudaDataType_t::CUDA_R_16F,
             k,
-            rhs.cu_deviceptr() as usize as *const c_void,
+            rhs.device_pointer().cu_deviceptr() as usize as *const c_void,
             cublas_sys::cudaDataType_t::CUDA_R_16F,
             k,
             beta_ptr,
-            out.cu_deviceptr() as usize as *mut c_void,
+            out.device_pointer().cu_deviceptr() as usize as *mut c_void,
             cublas_sys::cudaDataType_t::CUDA_R_16F,
             m,
             compute_type,
@@ -294,7 +294,7 @@ pub fn gemv_f16_op(
     out: Tensor<f16>,
     m: usize,
     k: usize,
-) -> Result<impl DeviceOperation<Output = Result<Tensor<f16>>>> {
+) -> Result<impl DeviceOp<Output = Result<Tensor<f16>>>> {
     ensure!(
         m > 0 && k > 0,
         "gemv requires positive dims, got m={m}, k={k}"
@@ -324,7 +324,7 @@ pub fn gemv_f16_op(
         })();
         value((matrix, vector, out, launch_status))
     })
-    .and_then(|(_matrix, _vector, out, launch_status)| value(launch_status.map(|()| out))))
+    .then(|(_matrix, _vector, out, launch_status)| value(launch_status.map(|()| out))))
 }
 
 pub fn gemm_f16_op(
@@ -334,7 +334,7 @@ pub fn gemm_f16_op(
     m: usize,
     n: usize,
     k: usize,
-) -> Result<impl DeviceOperation<Output = Result<Tensor<f16>>>> {
+) -> Result<impl DeviceOp<Output = Result<Tensor<f16>>>> {
     ensure!(
         m > 0 && n > 0 && k > 0,
         "gemm requires positive dims, got m={m}, n={n}, k={k}"
@@ -365,5 +365,5 @@ pub fn gemm_f16_op(
         })();
         value((matrix, rhs, out, launch_status))
     })
-    .and_then(|(_matrix, _rhs, out, launch_status)| value(launch_status.map(|()| out))))
+    .then(|(_matrix, _rhs, out, launch_status)| value(launch_status.map(|()| out))))
 }

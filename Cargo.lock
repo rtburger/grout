@@ -103,7 +103,7 @@ dependencies = [
  "bitflags",
  "cexpr",
  "clang-sys",
- "itertools 0.11.0",
+ "itertools 0.12.1",
  "lazy_static",
  "lazycell",
  "log",
@@ -320,19 +320,19 @@ checksum = "b05b61dc5112cbb17e4b6cd61790d9845d13888356391624cbe7e41efeac1e75"
 
 [[package]]
 name = "comrak"
-version = "0.50.0"
+version = "0.51.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "321d20bf105b6871a49da44c5fbb93e90a7cd6178ea5a9fe6cbc1e6d4504bc5e"
+checksum = "9f07383e7799d964bf7ffa6fc4457d177c54a44614661c7458bb0bd91b108e32"
 dependencies = [
  "caseless",
  "entities",
+ "finl_unicode",
  "jetscii",
  "phf 0.13.1",
  "phf_codegen",
  "rustc-hash 2.1.1",
  "smallvec",
  "typed-arena",
- "unicode_categories",
 ]
 
 [[package]]
@@ -408,36 +408,38 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "cuda-async"
-version = "0.0.1-alpha"
-source = "git+https://github.com/NVlabs/cutile-rs#0d8f36b02cee4cff203099eae4160cb4801a71cc"
+version = "0.0.1"
+source = "git+https://github.com/NVlabs/cutile-rs#4083d57f2b6cec72e6520d37a7209ec60ba34d8d"
 dependencies = [
  "anyhow",
  "cuda-core",
  "futures",
+ "half",
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "cuda-bindings"
-version = "0.0.1-alpha"
-source = "git+https://github.com/NVlabs/cutile-rs#0d8f36b02cee4cff203099eae4160cb4801a71cc"
+version = "0.0.1"
+source = "git+https://github.com/NVlabs/cutile-rs#4083d57f2b6cec72e6520d37a7209ec60ba34d8d"
 dependencies = [
  "bindgen 0.69.5",
 ]
 
 [[package]]
 name = "cuda-core"
-version = "0.0.1-alpha"
-source = "git+https://github.com/NVlabs/cutile-rs#0d8f36b02cee4cff203099eae4160cb4801a71cc"
+version = "0.0.1"
+source = "git+https://github.com/NVlabs/cutile-rs#4083d57f2b6cec72e6520d37a7209ec60ba34d8d"
 dependencies = [
  "anyhow",
  "cuda-bindings",
+ "half",
 ]
 
 [[package]]
 name = "cuda-tile-rs"
-version = "0.0.1-alpha"
-source = "git+https://github.com/NVlabs/cutile-rs#0d8f36b02cee4cff203099eae4160cb4801a71cc"
+version = "0.0.1"
+source = "git+https://github.com/NVlabs/cutile-rs#4083d57f2b6cec72e6520d37a7209ec60ba34d8d"
 dependencies = [
  "bindgen 0.71.1",
  "cc",
@@ -457,11 +459,10 @@ dependencies = [
 
 [[package]]
 name = "cutile"
-version = "0.0.1-alpha"
-source = "git+https://github.com/NVlabs/cutile-rs#0d8f36b02cee4cff203099eae4160cb4801a71cc"
+version = "0.0.1"
+source = "git+https://github.com/NVlabs/cutile-rs#4083d57f2b6cec72e6520d37a7209ec60ba34d8d"
 dependencies = [
  "anyhow",
- "candle-core",
  "cuda-async",
  "cuda-core",
  "cutile-compiler",
@@ -475,8 +476,8 @@ dependencies = [
 
 [[package]]
 name = "cutile-compiler"
-version = "0.0.1-alpha"
-source = "git+https://github.com/NVlabs/cutile-rs#0d8f36b02cee4cff203099eae4160cb4801a71cc"
+version = "0.0.1"
+source = "git+https://github.com/NVlabs/cutile-rs#4083d57f2b6cec72e6520d37a7209ec60ba34d8d"
 dependencies = [
  "anyhow",
  "cuda-async",
@@ -496,8 +497,8 @@ dependencies = [
 
 [[package]]
 name = "cutile-macro"
-version = "0.0.1-alpha"
-source = "git+https://github.com/NVlabs/cutile-rs#0d8f36b02cee4cff203099eae4160cb4801a71cc"
+version = "0.0.1"
+source = "git+https://github.com/NVlabs/cutile-rs#4083d57f2b6cec72e6520d37a7209ec60ba34d8d"
 dependencies = [
  "convert_case 0.8.0",
  "cutile-compiler",
@@ -656,6 +657,12 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+
+[[package]]
+name = "finl_unicode"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9844ddc3a6e533d62bba727eb6c28b5d360921d5175e9ff0f1e621a5c590a4d5"
 
 [[package]]
 name = "float8"
@@ -1196,9 +1203,9 @@ checksum = "670fdfda89751bc4a84ac13eaa63e205cf0fd22b4c9a5fbfa085b63c1f1d3a30"
 
 [[package]]
 name = "melior"
-version = "0.26.5"
+version = "0.26.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c49659ea7a2c612aa7b34fc0bd1baf5e691d051034616d3df624b912915bf81"
+checksum = "f5c38e8ea1f1bb22ebc7fe311b3adac0e9d3591e7c4d02a3b3b9c89d3e66899c"
 dependencies = [
  "melior-macro",
  "mlir-sys",
@@ -1206,9 +1213,9 @@ dependencies = [
 
 [[package]]
 name = "melior-macro"
-version = "0.19.1"
+version = "0.19.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62e27917e84caba4296e487807dfa5c810418d67eadc5540aa8bfe20d4529b31"
+checksum = "0e156c0973fdaaf2930149766775d85ff451e229739562cf50b0453f08024d2a"
 dependencies = [
  "comrak",
  "convert_case 0.11.0",
@@ -1244,9 +1251,9 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "mlir-sys"
-version = "210.0.1"
+version = "210.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "841d24c8c35df089fa46fff72a9e4d90beed3f8a4e7d07af633a2e5f5b0d11b7"
+checksum = "f376ddc92bf2bad0eba47e20f75923f76306e429273379cedb70eb7e664aab90"
 dependencies = [
  "bindgen 0.72.1",
 ]
@@ -1892,9 +1899,9 @@ dependencies = [
 
 [[package]]
 name = "tblgen"
-version = "0.7.2"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7364c3b3e7036cebffcc65895bff60ca160e1c9d98a84fb24f723e8c90b02a60"
+checksum = "0c4e3abe8582a0bb8708d11142c45e8c622f013bc4936d918da42c2aade60e98"
 dependencies = [
  "bindgen 0.72.1",
  "cc",
