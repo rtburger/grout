@@ -1,1 +1,7 @@
 /target
+
+# Benchmark/profiling outputs are generated locally and can be large.
+benchmarks/results/
+*.nsys-rep
+*.sqlite
+*.qdstrm

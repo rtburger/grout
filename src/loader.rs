@@ -1,15 +1,16 @@
 use crate::config::SafetensorsIndex;
 use anyhow::{Context, Result, bail};
-use cutile::api;
-use cutile::api::DeviceOpReshape;
-use cutile::half::{bf16, f16};
-use cutile::tensor::Tensor;
 use memmap2::MmapOptions;
+use rayon::prelude::*;
 use safetensors::{Dtype, SafeTensors};
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use cuda_async::device_operation::DeviceOp;
+use cutile::api;
+use cutile::core::f16;
+use cutile::tensor::{Reshape, Tensor};
 
 #[derive(Debug)]
 pub struct HostTensor {
@@ -36,15 +37,19 @@ impl WeightLoader {
             shard_files.insert(shard.clone());
         }
 
-        let mut shards = HashMap::new();
-        for shard in shard_files {
-            let shard_path = model_dir.join(&shard);
-            let file = File::open(&shard_path)
-                .with_context(|| format!("failed to open {}", shard_path.display()))?;
-            let mmap = unsafe { MmapOptions::new().map(&file) }
-                .with_context(|| format!("failed to mmap {}", shard_path.display()))?;
-            shards.insert(shard, mmap);
-        }
+        let shard_files: Vec<String> = shard_files.into_iter().collect();
+        let shard_entries: Vec<(String, memmap2::Mmap)> = shard_files
+            .par_iter()
+            .map(|shard| -> Result<(String, memmap2::Mmap)> {
+                let shard_path = model_dir.join(shard);
+                let file = std::fs::File::open(&shard_path)
+                    .with_context(|| format!("failed to open {}", shard_path.display()))?;
+                let mmap = unsafe { MmapOptions::new().map(&file) }
+                    .with_context(|| format!("failed to mmap {}", shard_path.display()))?;
+                Ok((shard.clone(), mmap))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let shards = shard_entries.into_iter().collect();
 
         Ok(Self {
             model_dir: model_dir.to_path_buf(),
@@ -79,16 +84,25 @@ impl WeightLoader {
         Ok(HostTensor { data, shape })
     }
 
-    pub async fn load_device_f16(&self, name: &str) -> Result<Arc<Tensor<f16>>> {
+    pub fn load_device_f16(
+        &self,
+        name: &str,
+        stream: &Arc<cuda_core::Stream>,
+    ) -> Result<Arc<Tensor<f16>>> {
         let host = self.load_host_f16(name)?;
         let shape = host.shape.clone();
         let host_data = Arc::new(host.data);
         let device_tensor = api::copy_host_vec_to_device(&host_data)
+            .sync_on(stream)
+            .map_err(|e| anyhow::anyhow!("copy to device failed: {e:?}"))?;
+        let device_tensor = device_tensor
             .reshape(&shape)
-            .await?;
+            .map_err(|e| anyhow::anyhow!("reshape failed: {e:?}"))?;
         Ok(Arc::new(device_tensor))
     }
 }
+
+use cutile::core::bf16;
 
 fn cast_to_f16(dtype: Dtype, data: &[u8]) -> Result<Vec<f16>> {
     match dtype {

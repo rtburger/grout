@@ -27,6 +27,7 @@ impl Qwen3Config {
             .with_context(|| format!("failed to read {}", cfg_path.display()))?;
         let cfg: Self = serde_json::from_str(&cfg_text)
             .with_context(|| format!("failed to parse {}", cfg_path.display()))?;
+        println!("cfg: {cfg:#?}");
         Ok(cfg)
     }
 

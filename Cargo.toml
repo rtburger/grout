@@ -2,16 +2,12 @@
 name = "grout"
 version = "0.1.0"
 edition = "2024"
+default-run = "grout"
+autobins = false
 
 [dependencies]
-cuda-core = { version = "0.0.2" }
-cuda-async = { version = "0.0.2" }
-cutile-compiler = { version = "0.0.2" }
-cutile = { version = "0.0.2" }
-
 anyhow = "1.0.102"
 clap = { version = "4.5.60", features = ["derive"] }
-cudarc = { version = "0.19.2", default-features = false, features = ["std", "cublas", "dynamic-loading", "cuda-13010"] }
 memmap2 = "0.9.10"
 rand = "0.8.5"
 rayon = "1.11.0"
@@ -20,4 +16,38 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros"] }
 tokenizers = "0.20.4"
-candle-core = "0.9.2"
+
+cudarc = { version = "0.19.2", default-features = false, features = ["std", "cublas", "dynamic-loading", "cuda-13010"] }
+
+cuda-bindings = "0.2.0"
+cuda-core = "0.2.0"
+cuda-async = "0.2.0"
+cutile-compiler = "0.2.0"
+cutile = "0.2.0"
+
+[features]
+benchmarks = []
+
+[[bin]]
+name = "grout"
+path = "src/main.rs"
+
+[[bin]]
+name = "grout_bench"
+path = "benchmarks/src/bin/grout_bench.rs"
+required-features = ["benchmarks"]
+
+[[bin]]
+name = "attention_microbench"
+path = "benchmarks/src/bin/attention_microbench.rs"
+required-features = ["benchmarks"]
+
+[[bin]]
+name = "gemv_microbench"
+path = "benchmarks/src/bin/gemv_microbench.rs"
+required-features = ["benchmarks"]
+
+[[bin]]
+name = "group_gemm_microbench"
+path = "benchmarks/src/bin/group_gemm_microbench.rs"
+required-features = ["benchmarks"]

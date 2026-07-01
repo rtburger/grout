@@ -2,7 +2,7 @@ use anyhow::Result;
 use cuda_async::device_operation::{DeviceOp, value};
 use cuda_core::Device;
 use cutile::api::{self, DeviceOpReshape};
-use cutile::half::f16;
+use cutile::core::f16;
 use cutile::tensor::{IntoPartition, ToHostVec};
 use cutile::tile_kernel::TileKernel;
 use grout::kernels::add_2d_f16;

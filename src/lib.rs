@@ -1,6 +1,6 @@
 mod config;
 mod cublas;
-mod cuda_graph;
+mod flash_decode;
 mod loader;
 
 pub mod kernels;

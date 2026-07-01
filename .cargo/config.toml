@@ -1,2 +1,3 @@
-[build]
-rustflags = ["-C", "target-cpu=native"]
+[env]
+CUDA_TOOLKIT_PATH = { value = "/usr/local/cuda-13", relative = false }
+RUSTFLAGS = { value = "-C target-cpu=native", relative = false }
