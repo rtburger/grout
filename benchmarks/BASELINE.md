@@ -90,9 +90,11 @@ Local roofline uses the RTX 4070 memory bandwidth of 504 GB/s.
 
 - Grout fp16 Qwen3-4B: ~8.05 GB weights/token * 55.4 tok/s = ~446 GB/s effective, ~89% of roofline. Ceiling is ~62.6 tok/s, so the fp16 runtime is already near memory-roofline on sm_89.
 - llama.cpp Qwen3-4B Q4_K_M: ~2.5 GB weights/token * 149.1 tok/s = ~373 GB/s effective, ~74% of roofline; ceiling is ~202 tok/s.
-- llama.cpp Qwen3-8B Q4_K_M: using the ~100 tok/s quantized roofline estimate, 90.0 tok/s is ~90% of that ceiling.
-- If quantized Grout retains ~85% memory efficiency after ~3.2x smaller weight reads, expected decode is ~170 tok/s on Qwen3-4B Q4_K_M and ~86-87 tok/s on Qwen3-8B Q4_K_M.
-- The old "2x candle" Phase 2 gate is physically impossible on the 4B: 2 * 117.7 = 235.4 tok/s, above the ~202 tok/s 4B Q4_K_M roofline. Phase 2 gate is now tracked in `AGENTS.md` as >=0.85x llama.cpp and >=1.15x pi-ai-candle, target >=1.0x llama.cpp.
+- llama.cpp Qwen3-8B Q4_K_M: ~5.0 GB weights/token * 90.0 tok/s = ~450 GB/s effective, ~89% of roofline; ceiling is ~101 tok/s.
+- A single effective-bandwidth-plus-fixed-overhead model cannot fit the llama.cpp 4B/8B points: `(5.0 - 2.5) GB / (1/90.0 - 1/149.1) s = ~568 GB/s`, above this card's 504 GB/s. The consistent read is shape-dependent efficiency: 4B Q4 shapes leave headroom, 8B Q4 shapes are already near roofline.
+- Quantized Grout expectation: Qwen3-4B Q4_K_M honest band 155-180 tok/s, with ~170 as midpoint. The midpoint carries a shape-efficiency caveat: a landing around 158 should trigger GEMV-shape investigation, not automatic failure or success.
+- Quantized Grout expectation: Qwen3-8B Q4_K_M plausible band 85-92 tok/s. This is a parity race; demanding materially above llama.cpp's 90.0 tok/s demands near-impossible roofline headroom.
+- The old "2x candle" Phase 2 gate is physically impossible on the 4B: 2 * 117.7 = 235.4 tok/s, above the ~202 tok/s 4B Q4_K_M roofline. The corrected Phase 2 gates are per-model in `AGENTS.md`: 4B hard >=135 tok/s, target >=149.1; 8B hard >=84 tok/s, target >=90.0.
 
 ## First-run kernel/JIT behavior
 
