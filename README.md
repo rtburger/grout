@@ -38,6 +38,22 @@ cargo run --release -- \
 
 The first run compiles all cuTile kernels (MLIR -> PTX -> CUBIN). Subsequent runs use the kernel cache.
 
+## Library API
+
+Grout exposes a minimal synchronous, token-driven API. Tokenization, streaming,
+cancellation, and async orchestration are caller responsibilities.
+
+```rust
+use grout::{Engine, LoadOpts};
+
+let mut engine = Engine::load("../hf_models/qwen3_4b", LoadOpts::default())?;
+engine.warmup()?;
+let logits = engine.prefill(&prompt_tokens)?;
+let next = argmax(logits.as_slice());
+let next_after_that = engine.decode_greedy(next)?;
+# anyhow::Ok(())
+```
+
 ## CLI options
 
 | Flag | Default | Description |
@@ -49,7 +65,7 @@ The first run compiles all cuTile kernels (MLIR -> PTX -> CUBIN). Subsequent run
 | `--sample` | `false` | Enable sampling (temperature/top-k) |
 | `--raw-prompt` | `false` | Skip chat template wrapping |
 | `--device-argmax` | `false` | Run greedy argmax on the GPU |
-| `--profile` | `false` | Print per-kernel timing breakdown |
+| `--profile` | `false` | Accepted for CLI compatibility; per-kernel profiling is not part of the frozen library API |
 
 ## Environment variables
 
@@ -65,7 +81,8 @@ The first run compiles all cuTile kernels (MLIR -> PTX -> CUBIN). Subsequent run
 ## Architecture
 
 ```
-main.rs         CLI (clap + tokio)
+api.rs          Frozen synchronous library API
+main.rs         CLI wired through the library API
 config.rs       Qwen3Config deserialization from config.json
 loader.rs       SafeTensors weight loading (mmap -> fp16 -> GPU)
 kernels.rs      cuTile Rust GPU kernels (#[cutile::module])

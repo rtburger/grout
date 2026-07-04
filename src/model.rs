@@ -2011,6 +2011,80 @@ impl Qwen3Engine {
         Ok(())
     }
 
+    pub(crate) fn api_vocab_size(&self) -> usize {
+        self.cfg.vocab_size
+    }
+
+    pub(crate) fn api_eos_token_ids(&self) -> &[u32] {
+        &self.eos_token_ids
+    }
+
+    pub(crate) fn api_arch(&self) -> &str {
+        "qwen3"
+    }
+
+    pub(crate) fn api_max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
+    pub(crate) async fn api_prefill_logits(&mut self, token_ids: &[u32]) -> Result<Vec<f32>> {
+        ensure!(!token_ids.is_empty(), "prefill requires at least one token");
+        ensure!(
+            token_ids.len() <= self.max_seq_len,
+            "prefill length {} exceeds max_seq_len={}",
+            token_ids.len(),
+            self.max_seq_len
+        );
+        self.reset_cache().await?;
+        let logits = self.step_seq_await(token_ids, 0).await?;
+        logits_to_f32(logits).await
+    }
+
+    pub(crate) async fn api_decode_logits(
+        &mut self,
+        token: u32,
+        position_start: usize,
+    ) -> Result<Vec<f32>> {
+        ensure!(
+            position_start < self.max_seq_len,
+            "decode position {} exceeds max_seq_len={}",
+            position_start,
+            self.max_seq_len
+        );
+        let token_ids = [token];
+        let logits = self.step_seq_await(&token_ids, position_start).await?;
+        logits_to_f32(logits).await
+    }
+
+    pub(crate) async fn api_decode_greedy(
+        &mut self,
+        token: u32,
+        position_start: usize,
+    ) -> Result<u32> {
+        ensure!(
+            position_start < self.max_seq_len,
+            "decode position {} exceeds max_seq_len={}",
+            position_start,
+            self.max_seq_len
+        );
+        let token_ids = [token];
+        let logits = self.step_seq_await(&token_ids, position_start).await?;
+        Ok(self.argmax_device(logits).await? as u32)
+    }
+
+    pub(crate) async fn api_reset(&mut self) -> Result<()> {
+        self.reset_cache().await
+    }
+
+    pub(crate) async fn api_warmup(&mut self, token: u32) -> Result<()> {
+        self.reset_cache().await?;
+        let token_ids = [token];
+        let _ = self.step_seq_await(&token_ids, 0).await?;
+        let _ = self.step_seq_await(&token_ids, 1).await?;
+        self.reset_cache().await?;
+        Ok(())
+    }
+
     pub fn encode_prompt(&self, prompt: &str) -> Result<Vec<u32>> {
         let encoding = self
             .tokenizer
@@ -6971,6 +7045,15 @@ fn max_decode_quant_gemv_part_rows(layers: &[Layer]) -> usize {
         .map(Weight::rows)
         .max()
         .unwrap_or(1)
+}
+
+async fn logits_to_f32(logits: Arc<Tensor<f16>>) -> Result<Vec<f32>> {
+    Ok(logits
+        .to_host_vec()
+        .await?
+        .into_iter()
+        .map(|v| v.to_f32())
+        .collect())
 }
 
 fn argmax_f16(values: &[f16]) -> usize {
