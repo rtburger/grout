@@ -3,7 +3,7 @@ use grout::Qwen3Engine;
 use std::path::{Path, PathBuf};
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "GGUF GPU e2e: set GROUT_QWEN3_06B_GGUF and GROUT_TOKENIZER_JSON if tokenizer.json is not next to the file"]
+#[ignore = "GGUF GPU e2e: set GROUT_QWEN3_06B_GGUF; tokenizer.json must be next to the file"]
 async fn qwen3_06b_gguf_generates_100_greedy_tokens() -> Result<()> {
     let Some(path) = env_path("GROUT_QWEN3_06B_GGUF") else {
         eprintln!("skipping: GROUT_QWEN3_06B_GGUF is not set");

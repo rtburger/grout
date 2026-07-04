@@ -147,7 +147,16 @@ fn config_from_gguf(gguf: &GgufFile) -> Result<Qwen3Config> {
         arch == "qwen3",
         "unsupported GGUF architecture `{arch}`; this engine only supports qwen3"
     );
-    let key = |suffix: &str| format!("{arch}.{suffix}");
+    // Exact Qwen3 GGUF metadata keys used by candle-transformers' quantized_qwen3 loader.
+    let block_count_key = "qwen3.block_count";
+    let embedding_length_key = "qwen3.embedding_length";
+    let feed_forward_length_key = "qwen3.feed_forward_length";
+    let head_count_key = "qwen3.attention.head_count";
+    let head_count_kv_key = "qwen3.attention.head_count_kv";
+    let key_length_key = "qwen3.attention.key_length";
+    let rope_freq_base_key = "qwen3.rope.freq_base";
+    let rms_epsilon_key = "qwen3.attention.layer_norm_rms_epsilon";
+    let context_length_key = "qwen3.context_length";
 
     let token_embd = metadata.tensor_info("token_embd.weight")?;
     ensure!(
@@ -160,30 +169,19 @@ fn config_from_gguf(gguf: &GgufFile) -> Result<Qwen3Config> {
     let cfg = Qwen3Config {
         vocab_size,
         hidden_size: metadata
-            .metadata_required(&key("embedding_length"))?
+            .metadata_required(&embedding_length_key)?
             .to_u32()? as usize,
         intermediate_size: metadata
-            .metadata_required(&key("feed_forward_length"))?
+            .metadata_required(&feed_forward_length_key)?
             .to_u32()? as usize,
-        num_hidden_layers: metadata.metadata_required(&key("block_count"))?.to_u32()? as usize,
-        num_attention_heads: metadata
-            .metadata_required(&key("attention.head_count"))?
-            .to_u32()? as usize,
-        num_key_value_heads: metadata
-            .metadata_required(&key("attention.head_count_kv"))?
-            .to_u32()? as usize,
-        head_dim: metadata
-            .metadata_required(&key("attention.key_length"))?
-            .to_u32()? as usize,
-        rms_norm_eps: metadata
-            .metadata_required(&key("attention.layer_norm_rms_epsilon"))?
-            .to_f32()?,
-        rope_theta: metadata
-            .metadata_required(&key("rope.freq_base"))?
-            .to_f32()?,
-        max_position_embeddings: metadata
-            .metadata_required(&key("context_length"))?
-            .to_u32()? as usize,
+        num_hidden_layers: metadata.metadata_required(&block_count_key)?.to_u32()? as usize,
+        num_attention_heads: metadata.metadata_required(&head_count_key)?.to_u32()? as usize,
+        num_key_value_heads: metadata.metadata_required(&head_count_kv_key)?.to_u32()? as usize,
+        head_dim: metadata.metadata_required(&key_length_key)?.to_u32()? as usize,
+        rms_norm_eps: metadata.metadata_required(&rms_epsilon_key)?.to_f32()?,
+        rope_theta: metadata.metadata_required(&rope_freq_base_key)?.to_f32()?,
+        max_position_embeddings: metadata.metadata_required(&context_length_key)?.to_u32()?
+            as usize,
         tie_word_embeddings: !metadata.has_tensor("output.weight"),
         use_sliding_window: false,
         eos_token_id: metadata

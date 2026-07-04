@@ -103,9 +103,8 @@ Run mode for this GGUF row: desktop/display-attached. Driver/toolkit/tileiras ve
 Command:
 
 ```bash
-GROUT_TOKENIZER_JSON=../hf_models/qwen3_4b/tokenizer.json \
 target/release/grout_bench \
-  --model /home/rtb/.cache/huggingface/hub/models--unsloth--Qwen3-4B-GGUF/snapshots/22c9fc8a8c7700b76a1789366280a6a5a1ad1120/Qwen3-4B-Q4_K_M.gguf \
+  --model ../hf_models/qwen3_4b_gguf/Qwen3-4B-Q4_K_M.gguf \
   --prompt 'Write one paragraph about compiler design, continuing until the token limit.' \
   --max-new-tokens 36 --reps 5 --warmup-reps 2 --ignore-eos --quiet
 ```
@@ -113,20 +112,18 @@ target/release/grout_bench \
 Result after GGUF Q4_K_M CPU dequantize-to-fp16 and unchanged engine upload:
 
 ```text
-  [grout] mean over 5 runs: decode_phase_tps=55.4, request_gen_tps=53.7, e2e_tps=91.0, elapsed=0.671s
+  [grout] mean over 5 runs: decode_phase_tps=54.4, request_gen_tps=52.8, e2e_tps=89.4, elapsed=0.682s
 ```
 
-This is within +/-3% of the Phase 0 fp16 Qwen3-4B baseline (`55.4 tok/s` decode). The ignored 4B GGUF integration test also passed with the same file and tokenizer.
+This is within +/-3% of the Phase 0 fp16 Qwen3-4B baseline (`55.4 tok/s` decode). The ignored 4B GGUF integration test also passed with the same file and adjacent tokenizer.
 
 Tier 2 GGUF integration commands run:
 
 ```bash
-GROUT_TOKENIZER_JSON=../hf_models/qwen3_4b/tokenizer.json \
 GROUT_QWEN3_06B_GGUF=../hf_models/qwen3_06b_gguf/Qwen3-0.6B-Q4_K_M.gguf \
 cargo test qwen3_06b_gguf_generates_100_greedy_tokens -- --ignored --nocapture
 
-GROUT_TOKENIZER_JSON=../hf_models/qwen3_4b/tokenizer.json \
-GROUT_QWEN3_4B_Q4_K_M_GGUF=/home/rtb/.cache/huggingface/hub/models--unsloth--Qwen3-4B-GGUF/snapshots/22c9fc8a8c7700b76a1789366280a6a5a1ad1120/Qwen3-4B-Q4_K_M.gguf \
+GROUT_QWEN3_4B_Q4_K_M_GGUF=../hf_models/qwen3_4b_gguf/Qwen3-4B-Q4_K_M.gguf \
 cargo test qwen3_4b_q4_k_m_gguf_generates_100_greedy_tokens -- --ignored --nocapture
 ```
 

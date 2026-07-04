@@ -1310,11 +1310,8 @@ fn tokenizer_json_path(model_path: &Path, is_gguf: bool) -> Result<PathBuf> {
     if sibling.exists() {
         return Ok(sibling);
     }
-    if let Ok(path) = std::env::var("GROUT_TOKENIZER_JSON") {
-        return Ok(PathBuf::from(path));
-    }
     bail!(
-        "GGUF model `{}` requires tokenizer.json next to the .gguf file or GROUT_TOKENIZER_JSON",
+        "GGUF model `{}` requires tokenizer.json next to the .gguf file",
         model_path.display()
     )
 }
