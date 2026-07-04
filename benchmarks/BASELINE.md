@@ -98,9 +98,13 @@ Local roofline uses the RTX 4070 memory bandwidth of 504 GB/s.
 
 ## Phase 1 GGUF fp16-compute gate
 
-Run mode for this GGUF row: desktop/display-attached. Driver/toolkit/tileiras versions are listed in Host/toolchain.
+Run mode for this GGUF row: desktop/display-attached.
 
-TODO: rerun the Qwen3-4B GGUF integration and throughput gate headless after the displays are moved off the 4070 or the desktop session is stopped, then append the headless row here.
+Version block for this row:
+
+- Driver: 595.58.03
+- CUDA toolkit: Arch `cuda` package 13.3.1-1; `/opt/cuda/bin/nvcc` CUDA 13.3, V13.3.73
+- tileiras: `/opt/cuda/bin/tileiras`, CUDA Tile IR assembler 13.3, V13.3.36
 
 Command:
 
@@ -128,6 +132,16 @@ cargo test qwen3_06b_gguf_generates_100_greedy_tokens -- --ignored --nocapture
 GROUT_QWEN3_4B_Q4_K_M_GGUF=../hf_models/qwen3_4b_gguf/Qwen3-4B-Q4_K_M.gguf \
 cargo test qwen3_4b_q4_k_m_gguf_generates_100_greedy_tokens -- --ignored --nocapture
 ```
+
+Phase 1 closeout notes:
+
+- `src/model.rs` changed only in `Qwen3Engine::load`: instantiate `WeightLoader` before config load, use GGUF metadata config when present, and locate adjacent `tokenizer.json` for `.gguf` files.
+- This could not live entirely in `loader.rs` because the engine constructor owns config selection, generation-config loading, tokenizer loading, and the `Qwen3Engine` fields; no forward pass, attention, StepGraph, or CUDA graph code changed.
+- Speed-gate inequality: desktop/display-attached result is `54.4 / 55.4 = 98.2%` of the headless Phase 0 baseline. Since desktop overhead is non-negative, loader regression is at most 1.8%, below the 3% gate.
+- Tier 1 coverage: default `cargo test` covers Q4_K, Q5_K, Q6_K, Q8_0, F16, and F32 bit-exact f32 dequant vs Candle CPU dequant, plus loud unsupported-type error coverage using a synthetic Q2_K GGUF tensor header.
+- Tier 2 coverage: ignored integration tests passed for Qwen3-0.6B Q4_K_M GGUF and Qwen3-4B Q4_K_M GGUF, each generating 100 greedy tokens and passing coherence checks.
+- Conditional token-exact 0.6B GGUF-vs-safetensors test status: skipped for lack of local matching F16/BF16 GGUF plus safetensors files. Quantized GGUF output is not compared token-for-token to fp16/bf16 safetensors.
+- Dependency delta: `Cargo.toml` adds only `candle-core = { path = "../candle/candle-core" }` under `[dev-dependencies]`. `Cargo.lock` records `candle-core` 0.11.0 and its transitive dev-only dependency graph; no release dependency was added for Phase 1.
 
 ## First-run kernel/JIT behavior
 
