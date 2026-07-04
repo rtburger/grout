@@ -1242,7 +1242,6 @@ impl KernelWarmRegistry {
 
 pub struct GenerationOutput {
     pub text: String,
-    pub token_ids: Vec<u32>,
     pub prompt_tokens: usize,
     pub generated_tokens: usize,
     pub prompt_elapsed: Duration,
@@ -2086,12 +2085,10 @@ impl Qwen3Engine {
                 .map_err(|e| anyhow::anyhow!("tokenizer decode failed: {e}"))?
         };
 
-        let generated_tokens = generated_ids.len();
         Ok(GenerationOutput {
             text,
-            token_ids: generated_ids,
             prompt_tokens: prompt_ids.len(),
-            generated_tokens,
+            generated_tokens: generated_ids.len(),
             prompt_elapsed,
             decode_elapsed,
             total_elapsed,

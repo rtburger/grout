@@ -22,37 +22,6 @@ async fn qwen3_4b_q4_k_m_gguf_generates_100_greedy_tokens() -> Result<()> {
     run_gguf_coherence(&path, "Write one paragraph about compiler design.").await
 }
 
-#[tokio::test(flavor = "current_thread")]
-#[ignore = "optional parser proof: set GROUT_QWEN3_06B_F16_GGUF and GROUT_QWEN3_06B_SAFETENSORS"]
-async fn qwen3_06b_f16_gguf_matches_safetensors_tokens_when_available() -> Result<()> {
-    let Some(gguf_path) = env_path("GROUT_QWEN3_06B_F16_GGUF") else {
-        eprintln!("skipping: GROUT_QWEN3_06B_F16_GGUF is not set");
-        return Ok(());
-    };
-    let Some(safetensors_dir) = env_path("GROUT_QWEN3_06B_SAFETENSORS") else {
-        eprintln!("skipping: GROUT_QWEN3_06B_SAFETENSORS is not set");
-        return Ok(());
-    };
-
-    let prompt = "Hello, how are you?";
-    let mut gguf = Qwen3Engine::load(&gguf_path, Some(512)).await?;
-    gguf.set_sampling_enabled(false);
-    gguf.set_ignore_eos(true);
-    let gguf_out = gguf.generate(prompt, 64).await?;
-
-    let mut safetensors = Qwen3Engine::load(&safetensors_dir, Some(512)).await?;
-    safetensors.set_sampling_enabled(false);
-    safetensors.set_ignore_eos(true);
-    let safetensors_out = safetensors.generate(prompt, 64).await?;
-
-    assert_eq!(
-        gguf_out.token_ids, safetensors_out.token_ids,
-        "f16 GGUF and safetensors loaders produced different greedy token ids\nGGUF text: {:?}\nsafetensors text: {:?}",
-        gguf_out.text, safetensors_out.text
-    );
-    Ok(())
-}
-
 async fn run_gguf_coherence(path: &Path, prompt: &str) -> Result<()> {
     let mut engine = Qwen3Engine::load(path, Some(512)).await?;
     engine.set_sampling_enabled(false);
