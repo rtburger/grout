@@ -1,6 +1,7 @@
 use crate::config::{Qwen3Config, SafetensorsIndex};
-use crate::dequant::dequantize_to_f16;
+use crate::dequant::{GgmlType, dequantize_to_f16};
 use crate::gguf::GgufFile;
+use crate::weights::{MatrixWeight, Weight};
 use anyhow::{Context, Result, bail, ensure};
 use memmap2::MmapOptions;
 use rayon::prelude::*;
@@ -120,15 +121,19 @@ impl WeightLoader {
         stream: &Arc<cuda_core::Stream>,
     ) -> Result<Arc<Tensor<f16>>> {
         let host = self.load_host_f16(name)?;
-        let shape = host.shape.clone();
-        let host_data = Arc::new(host.data);
-        let device_tensor = api::copy_host_vec_to_device(&host_data)
-            .sync_on(stream)
-            .map_err(|e| anyhow::anyhow!("copy to device failed: {e:?}"))?;
-        let device_tensor = device_tensor
-            .reshape(&shape)
-            .map_err(|e| anyhow::anyhow!("reshape failed: {e:?}"))?;
-        Ok(Arc::new(device_tensor))
+        copy_f16_to_device(host, stream)
+    }
+
+    pub fn load_device_weight(
+        &self,
+        name: &str,
+        stream: &Arc<cuda_core::Stream>,
+    ) -> Result<MatrixWeight> {
+        if let Some(gguf) = &self.gguf {
+            return load_device_weight_gguf(gguf, name, stream);
+        }
+        let tensor = self.load_device_f16(name, stream)?;
+        Ok(MatrixWeight::single(Weight::f16(tensor)?))
     }
 }
 
@@ -190,6 +195,60 @@ fn config_from_gguf(gguf: &GgufFile) -> Result<Qwen3Config> {
     };
     println!("cfg: {cfg:#?}");
     Ok(cfg)
+}
+
+fn copy_f16_to_device(
+    host: HostTensor,
+    stream: &Arc<cuda_core::Stream>,
+) -> Result<Arc<Tensor<f16>>> {
+    let shape = host.shape.clone();
+    let host_data = Arc::new(host.data);
+    let device_tensor = api::copy_host_vec_to_device(&host_data)
+        .sync_on(stream)
+        .map_err(|e| anyhow::anyhow!("copy to device failed: {e:?}"))?;
+    let device_tensor = device_tensor
+        .reshape(&shape)
+        .map_err(|e| anyhow::anyhow!("reshape failed: {e:?}"))?;
+    Ok(Arc::new(device_tensor))
+}
+
+fn load_device_weight_gguf(
+    gguf: &GgufFile,
+    engine_name: &str,
+    stream: &Arc<cuda_core::Stream>,
+) -> Result<MatrixWeight> {
+    let gguf_name = map_engine_tensor_name(engine_name, &gguf.content)
+        .with_context(|| format!("failed to map engine tensor `{engine_name}` to GGUF name"))?;
+    let (info, data) = gguf.tensor_data(&gguf_name)?;
+    ensure!(
+        info.dtype.is_supported_for_phase1(),
+        "unsupported ggml type {} for tensor `{gguf_name}`",
+        info.dtype
+    );
+    match info.dtype {
+        GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K => {
+            let host_data = Arc::new(data.to_vec());
+            let device_tensor = api::copy_host_vec_to_device(&host_data)
+                .sync_on(stream)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "copy quantized GGUF tensor `{gguf_name}` to device failed: {e:?}"
+                    )
+                })?;
+            let device_tensor = device_tensor.reshape(&[data.len()]).map_err(|e| {
+                anyhow::anyhow!("reshape quantized GGUF tensor `{gguf_name}` failed: {e:?}")
+            })?;
+            let weight =
+                Weight::quantized(info.dtype, Arc::new(device_tensor), info.shape.clone())?;
+            Ok(MatrixWeight::single(weight))
+        }
+        GgmlType::F16 | GgmlType::F32 => {
+            let host = load_host_f16_gguf(gguf, engine_name)?;
+            let tensor = copy_f16_to_device(host, stream)?;
+            Ok(MatrixWeight::single(Weight::f16(tensor)?))
+        }
+        other => bail!("unsupported ggml type {other} for tensor `{gguf_name}`"),
+    }
 }
 
 fn load_host_f16_gguf(gguf: &GgufFile, engine_name: &str) -> Result<HostTensor> {

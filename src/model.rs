@@ -3,17 +3,21 @@ use crate::cublas;
 use crate::flash_decode::attention_decode_kernel_grouped;
 use crate::kernels::{
     KernelKind, TILE_KERNEL_KINDS, add_2d_f16, add_rms_norm_decode_raw_f16, add_rms_norm_f16,
-    argmax_blocks_f16, argmax_reduce_blocks_to_u32, embedding_batch_f16,
+    argmax_blocks_f16, argmax_reduce_blocks_to_u32, dequant_q4k_to_f16, dequant_q5k_to_f16,
+    dequant_q6k_to_f16, dequant_q8_0_to_f16, embed_gather_q4k_f16, embed_gather_q5k_f16,
+    embed_gather_q6k_f16, embed_gather_q8_0_f16, embedding_batch_f16,
     flash_attn_causal_seq_dynpos_f16, flash_attn_causal_seq_f16, fmha_causal,
     fmha_decode_gqa_split, fmha_prefill_causal, fmha_prefill_gqa, fmha_prefill_gqa_lpt,
-    gather_row_f16, kv_cache_update_seq_dynpos_f16, kv_cache_update_seq_f16,
-    lm_head_argmax_blocks_f16, qk_norm_f16, qk_norm_rope_kv_decode_raw_f16,
-    qk_norm_rope_kv_prefill_raw_f16, qk_rope_dynpos_f16, rms_norm_f16, rope_seq_dynpos_f16,
-    rope_seq_f16, silu_mul_2d_f16, splitk_reduce_merge,
+    gather_row_f16, gemv_q4k_f16, gemv_q4k_f16_into, gemv_q5k_f16, gemv_q5k_f16_into, gemv_q6k_f16,
+    gemv_q6k_f16_into, gemv_q8_0_f16, gemv_q8_0_f16_into, kv_cache_update_seq_dynpos_f16,
+    kv_cache_update_seq_f16, lm_head_argmax_blocks_f16, qk_norm_f16,
+    qk_norm_rope_kv_decode_raw_f16, qk_norm_rope_kv_prefill_raw_f16, qk_rope_dynpos_f16,
+    rms_norm_f16, rope_seq_dynpos_f16, rope_seq_f16, silu_mul_2d_f16, splitk_reduce_merge,
 };
 use crate::loader::WeightLoader;
+use crate::weights::{MatrixWeight, Weight};
 use anyhow::{Context, Result, bail, ensure};
-use cuda_async::cuda_graph::CudaGraph;
+use cuda_async::cuda_graph::{CudaGraph, Scope};
 use cuda_async::device_operation::{DeviceOp, ExecutionContext, GraphNode, value, with_context};
 use cuda_async::error::DeviceError;
 use cuda_core::{
@@ -22,7 +26,8 @@ use cuda_core::{
 use cutile::api;
 use cutile::core::f16;
 use cutile::tensor::{
-    IntoPartition, IntoPartitionArc, Partition, PartitionMut, Reshape, Tensor, ToHostVec,
+    IntoPartition, IntoPartitionArc, Partition, PartitionMut, Reshape, Tensor, TensorView,
+    ToHostVec,
 };
 use cutile::tile_kernel::{CompileOptions, TileKernel};
 use rand::Rng;
@@ -511,6 +516,8 @@ struct DecodeBuffers {
     lse_scratch: Tensor<f32>, // [num_heads] — scratch for flash_decode LSE output
     argmax_block_max: Tensor<f32>, // [num_blocks] — stage-1 argmax per-block max
     argmax_block_idx: Tensor<u32>, // [num_blocks] — stage-1 argmax per-block argmax
+    // Reusable decode temp for quantized row-concat GEMV parts; LM head writes directly to logits.
+    quant_gemv_tmp: Tensor<f16>,
     // Split-K decode attention scratch. Default ON as of 2026-04-20:
     // fmha_decode_gqa_split + splitk_reduce_merge replace the old
     // flash_attn_causal_seq_dynpos_f16 path. Opt out with GROUT_FMHA_SPLIT_KV=0.
@@ -1205,10 +1212,10 @@ struct LayerWeights {
     post_attention_layernorm: Arc<Tensor<f16>>,
     q_norm: Arc<Tensor<f16>>,
     k_norm: Arc<Tensor<f16>>,
-    qkv_proj: Arc<Tensor<f16>>,
-    o_proj: Arc<Tensor<f16>>,
-    gate_up_proj: Arc<Tensor<f16>>,
-    down_proj: Arc<Tensor<f16>>,
+    qkv_proj: MatrixWeight,
+    o_proj: MatrixWeight,
+    gate_up_proj: MatrixWeight,
+    down_proj: MatrixWeight,
 }
 
 struct LayerState {
@@ -1277,8 +1284,8 @@ pub struct Qwen3Engine {
     cfg: Qwen3Config,
     tokenizer: Tokenizer,
     model_dir: std::path::PathBuf,
-    embed_tokens: Arc<Tensor<f16>>,
-    lm_head: Arc<Tensor<f16>>,
+    embed_tokens: MatrixWeight,
+    lm_head: MatrixWeight,
     norm: Arc<Tensor<f16>>,
     inv_freq: Arc<Tensor<f32>>,
     layers: Vec<Layer>,
@@ -1298,6 +1305,7 @@ pub struct Qwen3Engine {
     step_graph_cache: HashMap<usize, Arc<StepGraph>>,
     step_pool_cache: HashMap<usize, TensorPool>,
     decode_runner: Option<DecodeCudaGraphRunner>,
+    quant_prefill_scratch: Option<Tensor<f16>>,
 }
 
 fn tokenizer_json_path(model_path: &Path, is_gguf: bool) -> Result<PathBuf> {
@@ -1379,13 +1387,13 @@ impl Qwen3Engine {
         let stream = with_context(|ctx| value(ctx.get_cuda_stream().clone())).await?;
 
         let embed_tokens = loader
-            .load_device_f16("model.embed_tokens.weight", &stream)
+            .load_device_weight("model.embed_tokens.weight", &stream)
             .context("failed to load model.embed_tokens.weight")?;
         let lm_head = if cfg.tie_word_embeddings {
             embed_tokens.clone()
         } else {
             loader
-                .load_device_f16("lm_head.weight", &stream)
+                .load_device_weight("lm_head.weight", &stream)
                 .context("failed to load lm_head.weight")?
         };
         let norm = loader
@@ -1397,16 +1405,17 @@ impl Qwen3Engine {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
             let q_proj =
-                load_layer_weight(&loader, &stream, i, "self_attn.q_proj.weight", "q_proj")?;
+                load_layer_matrix_weight(&loader, &stream, i, "self_attn.q_proj.weight", "q_proj")?;
             let k_proj =
-                load_layer_weight(&loader, &stream, i, "self_attn.k_proj.weight", "k_proj")?;
+                load_layer_matrix_weight(&loader, &stream, i, "self_attn.k_proj.weight", "k_proj")?;
             let v_proj =
-                load_layer_weight(&loader, &stream, i, "self_attn.v_proj.weight", "v_proj")?;
+                load_layer_matrix_weight(&loader, &stream, i, "self_attn.v_proj.weight", "v_proj")?;
             let qkv_proj = concat_weight_rows_2d(&stream, &[&q_proj, &k_proj, &v_proj])?;
 
             let gate_proj =
-                load_layer_weight(&loader, &stream, i, "mlp.gate_proj.weight", "gate_proj")?;
-            let up_proj = load_layer_weight(&loader, &stream, i, "mlp.up_proj.weight", "up_proj")?;
+                load_layer_matrix_weight(&loader, &stream, i, "mlp.gate_proj.weight", "gate_proj")?;
+            let up_proj =
+                load_layer_matrix_weight(&loader, &stream, i, "mlp.up_proj.weight", "up_proj")?;
             let gate_up_proj = concat_weight_rows_2d(&stream, &[&gate_proj, &up_proj])?;
 
             let weights = LayerWeights {
@@ -1439,7 +1448,7 @@ impl Qwen3Engine {
                     "k_norm",
                 )?,
                 qkv_proj,
-                o_proj: load_layer_weight(
+                o_proj: load_layer_matrix_weight(
                     &loader,
                     &stream,
                     i,
@@ -1447,7 +1456,7 @@ impl Qwen3Engine {
                     "o_proj",
                 )?,
                 gate_up_proj,
-                down_proj: load_layer_weight(
+                down_proj: load_layer_matrix_weight(
                     &loader,
                     &stream,
                     i,
@@ -1470,6 +1479,16 @@ impl Qwen3Engine {
                 },
             });
         }
+
+        let quant_prefill_scratch_elems = max_transformer_quant_weight_elems(&layers);
+        let quant_prefill_scratch = match quant_prefill_scratch_elems {
+            Some(elems) => Some(
+                api::zeros::<f16>(&[elems])
+                    .sync_on(&stream)
+                    .map_err(|e| anyhow::anyhow!("alloc quant prefill scratch failed: {e:?}"))?,
+            ),
+            None => None,
+        };
 
         Ok(Self {
             cfg,
@@ -1496,6 +1515,7 @@ impl Qwen3Engine {
             step_graph_cache: HashMap::new(),
             step_pool_cache: HashMap::new(),
             decode_runner: None,
+            quant_prefill_scratch,
         })
     }
 
@@ -2329,6 +2349,7 @@ impl Qwen3Engine {
         let lm_head_argmax_block_k = 32usize;
         let debug_logits_enabled = std::env::var("GROUT_DEBUG_LOGITS").ok().as_deref() == Some("1");
         let use_fused_lm_head_argmax = env_bool_or("GROUT_FUSED_LM_HEAD_ARGMAX", false)
+            && self.lm_head.is_f16_single()
             && self.use_device_argmax
             && !self.do_sample
             && !debug_logits_enabled
@@ -2381,6 +2402,7 @@ impl Qwen3Engine {
                 CompileOptions::default()
             }
         };
+        let quant_gemv_tmp_rows = max_decode_quant_gemv_part_rows(&self.layers).max(1);
         let mut bufs = DecodeBuffers {
             hidden: alloc(&[1, d])?,
             normed: alloc(&[1, d])?,
@@ -2408,6 +2430,7 @@ impl Qwen3Engine {
             argmax_block_idx: api::zeros::<u32>(&[num_argmax_blocks])
                 .sync_on(stream)
                 .map_err(|e| anyhow::anyhow!("alloc argmax_block_idx failed: {e:?}"))?,
+            quant_gemv_tmp: alloc(&[quant_gemv_tmp_rows])?,
             // Flat layout [kv_heads, NUM_KV_SPLITS * GROUP, D] (att) and
             // [kv_heads, NUM_KV_SPLITS * GROUP] (lse) — split-major. See
             // comments in fmha_decode_gqa_split / splitk_reduce_merge.
@@ -2457,14 +2480,8 @@ impl Qwen3Engine {
             // tile-kernel compilation, etc. happen outside graph capture.
             {
                 // Embedding (just prime with zeros — actual token loaded at launch)
-                embedding_batch_f16(
-                    &token_ids,
-                    &*self.embed_tokens,
-                    (&mut bufs.hidden).partition([1, embed_block]),
-                )
-                .generics(vec![d.to_string(), embed_block.to_string()])
-                .sync_on(stream)
-                .map_err(|e| anyhow::anyhow!("prime embedding failed: {e:?}"))?;
+                self.decode_embedding_sync_on(stream, &token_ids, &mut bufs.hidden, embed_block)
+                    .context("prime embedding failed")?;
 
                 for layer_idx in 0..num_layers {
                     let w = &self.layers[layer_idx].weights;
@@ -2505,16 +2522,20 @@ impl Qwen3Engine {
                         .map_err(|e| anyhow::anyhow!("prime add_rms_norm input failed: {e:?}"))?;
                     }
 
-                    // QKV GEMV (cuBLAS uses raw device pointers + explicit m/k)
-                    cublas::GemvInPlace {
-                        matrix: &*w.qkv_proj,
-                        vector: &bufs.normed,
-                        out: &bufs.qkv,
-                        m: qkv_width as i32,
-                        k: d as i32,
-                    }
-                    .sync_on(stream)
-                    .map_err(|e| anyhow::anyhow!("prime qkv gemv failed: {e:?}"))?;
+                    // QKV GEMV
+                    let normed_1d = bufs
+                        .normed
+                        .view(&[d])
+                        .map_err(|e| anyhow::anyhow!("view normed failed: {e:?}"))?;
+                    self.decode_gemv_sync_on(
+                        stream,
+                        &w.qkv_proj,
+                        &bufs.normed,
+                        &normed_1d,
+                        &mut bufs.qkv,
+                        &mut bufs.quant_gemv_tmp,
+                        "prime qkv gemv",
+                    )?;
 
                     // Slice Q, K, V — use 1D view so slices are contiguous
                     let qkv_1d = bufs
@@ -2861,15 +2882,19 @@ impl Qwen3Engine {
                     }
 
                     // O projection
-                    cublas::GemvInPlace {
-                        matrix: &*w.o_proj,
-                        vector: &bufs.attn_out,
-                        out: &bufs.attn_proj,
-                        m: d as i32,
-                        k: attn_width as i32,
-                    }
-                    .sync_on(stream)
-                    .map_err(|e| anyhow::anyhow!("prime o_proj gemv failed: {e:?}"))?;
+                    let attn_out_1d = bufs
+                        .attn_out
+                        .view(&[attn_width])
+                        .map_err(|e| anyhow::anyhow!("view attn_out failed: {e:?}"))?;
+                    self.decode_gemv_sync_on(
+                        stream,
+                        &w.o_proj,
+                        &bufs.attn_out,
+                        &attn_out_1d,
+                        &mut bufs.attn_proj,
+                        &mut bufs.quant_gemv_tmp,
+                        "prime o_proj gemv",
+                    )?;
 
                     // Add + RMS norm
                     unsafe {
@@ -2888,15 +2913,19 @@ impl Qwen3Engine {
                     .map_err(|e| anyhow::anyhow!("prime add_rms_norm failed: {e:?}"))?;
 
                     // Gate+Up GEMV
-                    cublas::GemvInPlace {
-                        matrix: &*w.gate_up_proj,
-                        vector: &bufs.ff_normed,
-                        out: &bufs.gate_up,
-                        m: (2 * inter_size) as i32,
-                        k: d as i32,
-                    }
-                    .sync_on(stream)
-                    .map_err(|e| anyhow::anyhow!("prime gate_up gemv failed: {e:?}"))?;
+                    let ff_normed_1d = bufs
+                        .ff_normed
+                        .view(&[d])
+                        .map_err(|e| anyhow::anyhow!("view ff_normed failed: {e:?}"))?;
+                    self.decode_gemv_sync_on(
+                        stream,
+                        &w.gate_up_proj,
+                        &bufs.ff_normed,
+                        &ff_normed_1d,
+                        &mut bufs.gate_up,
+                        &mut bufs.quant_gemv_tmp,
+                        "prime gate_up gemv",
+                    )?;
 
                     // Slice gate, up — 1D for contiguity, then reshape to 2D for kernel
                     let gu_1d = bufs
@@ -2927,15 +2956,19 @@ impl Qwen3Engine {
                     .map_err(|e| anyhow::anyhow!("prime silu_mul failed: {e:?}"))?;
 
                     // Down GEMV
-                    cublas::GemvInPlace {
-                        matrix: &*w.down_proj,
-                        vector: &bufs.ff,
-                        out: &bufs.ff_down,
-                        m: d as i32,
-                        k: inter_size as i32,
-                    }
-                    .sync_on(stream)
-                    .map_err(|e| anyhow::anyhow!("prime down gemv failed: {e:?}"))?;
+                    let ff_1d = bufs
+                        .ff
+                        .view(&[inter_size])
+                        .map_err(|e| anyhow::anyhow!("view ff failed: {e:?}"))?;
+                    self.decode_gemv_sync_on(
+                        stream,
+                        &w.down_proj,
+                        &bufs.ff,
+                        &ff_1d,
+                        &mut bufs.ff_down,
+                        &mut bufs.quant_gemv_tmp,
+                        "prime down gemv",
+                    )?;
 
                     // Residual add is deferred to the next layer's input norm
                     // (or the final epilogue norm for the last layer).
@@ -2958,9 +2991,13 @@ impl Qwen3Engine {
                 .map_err(|e| anyhow::anyhow!("prime final add_rms_norm failed: {e:?}"))?;
 
                 if use_fused_lm_head_argmax {
+                    let lm_head = self
+                        .lm_head
+                        .single_f16()
+                        .context("fused lm_head_argmax requires f16 lm_head")?;
                     unsafe {
                         lm_head_argmax_blocks_f16(
-                            &*self.lm_head,
+                            &**lm_head,
                             &bufs.normed,
                             (&mut bufs.argmax_block_max).partition([1]),
                             (&mut bufs.argmax_block_idx).partition([1]),
@@ -2972,15 +3009,19 @@ impl Qwen3Engine {
                     .map_err(|e| anyhow::anyhow!("prime fused lm_head_argmax failed: {e:?}"))?;
                 } else {
                     // LM head GEMV
-                    cublas::GemvInPlace {
-                        matrix: &*self.lm_head,
-                        vector: &bufs.normed,
-                        out: &bufs.logits,
-                        m: vocab_size as i32,
-                        k: d as i32,
-                    }
-                    .sync_on(stream)
-                    .map_err(|e| anyhow::anyhow!("prime lm_head gemv failed: {e:?}"))?;
+                    let normed_1d = bufs
+                        .normed
+                        .view(&[d])
+                        .map_err(|e| anyhow::anyhow!("view normed failed: {e:?}"))?;
+                    self.decode_gemv_sync_on(
+                        stream,
+                        &self.lm_head,
+                        &bufs.normed,
+                        &normed_1d,
+                        &mut bufs.logits,
+                        &mut bufs.quant_gemv_tmp,
+                        "prime lm_head gemv",
+                    )?;
 
                     // Prime two-stage argmax kernels so they're JIT'd before graph capture.
                     let logits_flat_prime = bufs
@@ -3014,14 +3055,7 @@ impl Qwen3Engine {
             // ── Graph capture via CudaGraph::scope ────────────────────────────
             let graph = CudaGraph::scope(stream, |s| {
                 // Embedding: token_ids → hidden
-                s.record(
-                    embedding_batch_f16(
-                        &token_ids,
-                        &*self.embed_tokens,
-                        (&mut bufs.hidden).partition([1, embed_block]),
-                    )
-                    .generics(vec![d.to_string(), embed_block.to_string()]),
-                )?;
+                self.decode_embedding_record_scope(s, &token_ids, &mut bufs.hidden, embed_block)?;
 
                 for layer_idx in 0..num_layers {
                     let w = &self.layers[layer_idx].weights;
@@ -3062,15 +3096,19 @@ impl Qwen3Engine {
                     }
 
                     // QKV GEMV: normed → qkv
-                    // cuBLAS uses raw device pointers + explicit m/k, so the
-                    // base tensor works regardless of its metadata shape.
-                    s.record(cublas::GemvInPlace {
-                        matrix: &*w.qkv_proj,
-                        vector: &bufs.normed,
-                        out: &bufs.qkv,
-                        m: qkv_width as i32,
-                        k: d as i32,
-                    })?;
+                    let normed_1d = bufs
+                        .normed
+                        .view(&[d])
+                        .map_err(|e| anyhow::anyhow!("view normed: {e:?}"))?;
+                    self.decode_gemv_record_scope(
+                        s,
+                        &w.qkv_proj,
+                        &bufs.normed,
+                        &normed_1d,
+                        &mut bufs.qkv,
+                        &mut bufs.quant_gemv_tmp,
+                        "qkv gemv",
+                    )?;
 
                     // Zero-copy slice Q, K, V from qkv.
                     // Slice in 1D so views are contiguous (avoids stride mismatch).
@@ -3400,13 +3438,19 @@ impl Qwen3Engine {
                     }
 
                     // O projection: attn_out → attn_proj
-                    s.record(cublas::GemvInPlace {
-                        matrix: &*w.o_proj,
-                        vector: &bufs.attn_out,
-                        out: &bufs.attn_proj,
-                        m: d as i32,
-                        k: attn_width as i32,
-                    })?;
+                    let attn_out_1d = bufs
+                        .attn_out
+                        .view(&[attn_width])
+                        .map_err(|e| anyhow::anyhow!("view attn_out: {e:?}"))?;
+                    self.decode_gemv_record_scope(
+                        s,
+                        &w.o_proj,
+                        &bufs.attn_out,
+                        &attn_out_1d,
+                        &mut bufs.attn_proj,
+                        &mut bufs.quant_gemv_tmp,
+                        "o_proj gemv",
+                    )?;
 
                     // Fused add + RMS norm: (hidden + attn_proj) → (hidden_after_attn, ff_normed)
                     s.record(
@@ -3425,13 +3469,19 @@ impl Qwen3Engine {
                     )?;
 
                     // Gate+Up GEMV: ff_normed → gate_up
-                    s.record(cublas::GemvInPlace {
-                        matrix: &*w.gate_up_proj,
-                        vector: &bufs.ff_normed,
-                        out: &bufs.gate_up,
-                        m: (2 * inter_size) as i32,
-                        k: d as i32,
-                    })?;
+                    let ff_normed_1d = bufs
+                        .ff_normed
+                        .view(&[d])
+                        .map_err(|e| anyhow::anyhow!("view ff_normed: {e:?}"))?;
+                    self.decode_gemv_record_scope(
+                        s,
+                        &w.gate_up_proj,
+                        &bufs.ff_normed,
+                        &ff_normed_1d,
+                        &mut bufs.gate_up,
+                        &mut bufs.quant_gemv_tmp,
+                        "gate_up gemv",
+                    )?;
 
                     // Zero-copy slice gate, up — 1D for contiguity, reshape to 2D for kernel
                     let gu_1d = bufs
@@ -3462,13 +3512,19 @@ impl Qwen3Engine {
                     )?;
 
                     // Down GEMV: ff → ff_down
-                    s.record(cublas::GemvInPlace {
-                        matrix: &*w.down_proj,
-                        vector: &bufs.ff,
-                        out: &bufs.ff_down,
-                        m: d as i32,
-                        k: inter_size as i32,
-                    })?;
+                    let ff_1d = bufs
+                        .ff
+                        .view(&[inter_size])
+                        .map_err(|e| anyhow::anyhow!("view ff: {e:?}"))?;
+                    self.decode_gemv_record_scope(
+                        s,
+                        &w.down_proj,
+                        &bufs.ff,
+                        &ff_1d,
+                        &mut bufs.ff_down,
+                        &mut bufs.quant_gemv_tmp,
+                        "down gemv",
+                    )?;
 
                     // Residual add is deferred to the next layer's input norm
                     // (or the final epilogue norm for the last layer).
@@ -3491,10 +3547,13 @@ impl Qwen3Engine {
                 )?;
 
                 if use_fused_lm_head_argmax {
+                    let lm_head = self.lm_head.single_f16().ok_or_else(|| {
+                        DeviceError::Internal("fused lm_head_argmax requires f16 lm_head".into())
+                    })?;
                     s.record(
                         unsafe {
                             lm_head_argmax_blocks_f16(
-                                &*self.lm_head,
+                                &**lm_head,
                                 &bufs.normed,
                                 (&mut bufs.argmax_block_max).partition([1]),
                                 (&mut bufs.argmax_block_idx).partition([1]),
@@ -3505,13 +3564,19 @@ impl Qwen3Engine {
                     )?;
                 } else {
                     // LM head GEMV: normed → logits
-                    s.record(cublas::GemvInPlace {
-                        matrix: &*self.lm_head,
-                        vector: &bufs.normed,
-                        out: &bufs.logits,
-                        m: vocab_size as i32,
-                        k: d as i32,
-                    })?;
+                    let normed_1d = bufs
+                        .normed
+                        .view(&[d])
+                        .map_err(|e| anyhow::anyhow!("view normed: {e:?}"))?;
+                    self.decode_gemv_record_scope(
+                        s,
+                        &self.lm_head,
+                        &bufs.normed,
+                        &normed_1d,
+                        &mut bufs.logits,
+                        &mut bufs.quant_gemv_tmp,
+                        "lm_head gemv",
+                    )?;
 
                     // In-graph greedy argmax: logits → token_ids[0]. Writing back to
                     // the same buffer the embedding reads means the next graph replay
@@ -3624,7 +3689,7 @@ impl Qwen3Engine {
         for layer_idx in 0..self.cfg.num_hidden_layers {
             let o_proj = &self.layers[layer_idx].weights.o_proj;
             ensure!(
-                o_proj.shape().len() == 2 && o_proj.shape()[1] as usize == attn_width,
+                o_proj.shape().len() == 2 && o_proj.shape()[1] == attn_width,
                 "o_proj expected input dim {}, got shape {:?}",
                 attn_width,
                 o_proj.shape()
@@ -3966,7 +4031,7 @@ impl Qwen3Engine {
                     values[out.idx()] = Some(Arc::new(out_tensor));
                 }
                 GraphOp::MatMul { matrix, rhs, out } => {
-                    let matrix = self.resolve_tensor_ref(&values, *matrix)?;
+                    let matrix = self.resolve_matrix_tensor_ref(&values, *matrix)?;
                     let rhs = self.resolve_tensor_ref(&values, *rhs)?;
                     let out_buf = self.checkout_graph_output_ctx(
                         ctx,
@@ -3983,7 +4048,7 @@ impl Qwen3Engine {
                     vector,
                     out,
                 } => {
-                    let matrix = self.resolve_tensor_ref(&values, *matrix)?;
+                    let matrix = self.resolve_matrix_tensor_ref(&values, *matrix)?;
                     let vector = self.resolve_tensor_ref(&values, *vector)?;
                     let out_buf = self.checkout_graph_output_ctx(
                         ctx,
@@ -4170,7 +4235,7 @@ impl Qwen3Engine {
                     rhs,
                     out,
                 } => {
-                    let matrix = self.resolve_tensor_ref(&values, *matrix)?;
+                    let matrix = self.resolve_matrix_tensor_ref(&values, *matrix)?;
                     let rhs = self.resolve_tensor_ref(&values, *rhs)?;
                     let out_buf = self.checkout_graph_output_ctx(
                         ctx,
@@ -4506,23 +4571,45 @@ impl Qwen3Engine {
         Ok(())
     }
 
-    fn resolve_weight_ref(&self, weight: WeightRef) -> Arc<Tensor<f16>> {
+    fn resolve_weight_ref(&self, weight: WeightRef) -> Result<Arc<Tensor<f16>>> {
         match weight {
-            WeightRef::LmHead => self.lm_head.clone(),
-            WeightRef::Norm => self.norm.clone(),
+            WeightRef::Norm => Ok(self.norm.clone()),
             WeightRef::Layer { layer_idx, slot } => {
                 let layer = &self.layers[layer_idx].weights;
                 match slot {
-                    LayerWeightSlot::InputLayerNorm => layer.input_layernorm.clone(),
+                    LayerWeightSlot::InputLayerNorm => Ok(layer.input_layernorm.clone()),
                     LayerWeightSlot::PostAttentionLayerNorm => {
-                        layer.post_attention_layernorm.clone()
+                        Ok(layer.post_attention_layernorm.clone())
                     }
-                    LayerWeightSlot::QNorm => layer.q_norm.clone(),
-                    LayerWeightSlot::KNorm => layer.k_norm.clone(),
-                    LayerWeightSlot::QkvProj => layer.qkv_proj.clone(),
-                    LayerWeightSlot::OProj => layer.o_proj.clone(),
-                    LayerWeightSlot::GateUpProj => layer.gate_up_proj.clone(),
-                    LayerWeightSlot::DownProj => layer.down_proj.clone(),
+                    LayerWeightSlot::QNorm => Ok(layer.q_norm.clone()),
+                    LayerWeightSlot::KNorm => Ok(layer.k_norm.clone()),
+                    LayerWeightSlot::QkvProj
+                    | LayerWeightSlot::OProj
+                    | LayerWeightSlot::GateUpProj
+                    | LayerWeightSlot::DownProj => {
+                        bail!("projection weight {slot:?} is not an f16 tensor ref")
+                    }
+                }
+            }
+            WeightRef::LmHead => bail!("lm_head is a matrix weight, not an f16 tensor ref"),
+        }
+    }
+
+    fn resolve_matrix_weight_ref(&self, weight: WeightRef) -> Result<MatrixWeight> {
+        match weight {
+            WeightRef::LmHead => Ok(self.lm_head.clone()),
+            WeightRef::Norm => bail!("norm is not a matrix weight"),
+            WeightRef::Layer { layer_idx, slot } => {
+                let layer = &self.layers[layer_idx].weights;
+                match slot {
+                    LayerWeightSlot::QkvProj => Ok(layer.qkv_proj.clone()),
+                    LayerWeightSlot::OProj => Ok(layer.o_proj.clone()),
+                    LayerWeightSlot::GateUpProj => Ok(layer.gate_up_proj.clone()),
+                    LayerWeightSlot::DownProj => Ok(layer.down_proj.clone()),
+                    LayerWeightSlot::InputLayerNorm
+                    | LayerWeightSlot::PostAttentionLayerNorm
+                    | LayerWeightSlot::QNorm
+                    | LayerWeightSlot::KNorm => bail!("norm slot {slot:?} is not a matrix weight"),
                 }
             }
         }
@@ -4538,7 +4625,24 @@ impl Qwen3Engine {
                 .as_ref()
                 .cloned()
                 .with_context(|| format!("missing graph value {}", v.idx())),
-            TensorRef::Weight(w) => Ok(self.resolve_weight_ref(w)),
+            TensorRef::Weight(w) => self.resolve_weight_ref(w),
+        }
+    }
+
+    fn resolve_matrix_tensor_ref(
+        &self,
+        values: &[Option<Arc<Tensor<f16>>>],
+        input: TensorRef,
+    ) -> Result<MatrixWeight> {
+        match input {
+            TensorRef::Weight(w) => self.resolve_matrix_weight_ref(w),
+            TensorRef::Value(v) => {
+                let tensor = values[v.idx()]
+                    .as_ref()
+                    .cloned()
+                    .with_context(|| format!("missing graph value {}", v.idx()))?;
+                Ok(MatrixWeight::single(Weight::f16(tensor)?))
+            }
         }
     }
 
@@ -4588,24 +4692,8 @@ impl Qwen3Engine {
         );
 
         let ids_host = Arc::new(token_ids.to_vec());
-        let ids = unsafe { api::copy_host_vec_to_device(&ids_host).execute(ctx)? };
-        let embed_block = env_usize_or("GROUT_EMBED_BLOCK", EMBED_BLOCK);
-        let out = out.partition([1, embed_block]);
-        let result = unsafe {
-            embedding_batch_f16(
-                value(Arc::new(ids)),
-                value(self.embed_tokens.clone()),
-                value(out),
-            )
-            .generics(vec![
-                self.cfg.hidden_size.to_string(),
-                embed_block.to_string(),
-            ])
-            .execute(ctx)?
-        };
-        let _ids: Arc<Tensor<u32>> = result.0;
-        let out: Partition<Tensor<f16>> = result.2;
-        Ok(out.unpartition())
+        let ids = Arc::new(unsafe { api::copy_host_vec_to_device(&ids_host).execute(ctx)? });
+        self.embedding_batch_device_ids_into_ctx(ctx, ids, out)
     }
 
     fn embedding_batch_from_device_ids_into_ctx(
@@ -4630,111 +4718,192 @@ impl Qwen3Engine {
             out.shape()
         );
 
-        let embed_block = env_usize_or("GROUT_EMBED_BLOCK", EMBED_BLOCK);
-        let out = out.partition([1, embed_block]);
-        let result = unsafe {
-            embedding_batch_f16(
-                value(token_ids),
-                value(self.embed_tokens.clone()),
-                value(out),
-            )
-            .generics(vec![
-                self.cfg.hidden_size.to_string(),
-                embed_block.to_string(),
-            ])
-            .execute(ctx)?
+        self.embedding_batch_device_ids_into_ctx(ctx, token_ids, out)
+    }
+
+    fn embedding_batch_device_ids_into_ctx(
+        &self,
+        ctx: &ExecutionContext,
+        token_ids: Arc<Tensor<u32>>,
+        out: Tensor<f16>,
+    ) -> Result<Tensor<f16>> {
+        let seqlen = token_ids.shape()[0] as usize;
+        match self.embed_tokens.parts() {
+            [Weight::F16 { data, .. }] => {
+                let embed_block = env_usize_or("GROUT_EMBED_BLOCK", EMBED_BLOCK);
+                let out = out.partition([1, embed_block]);
+                let result = unsafe {
+                    embedding_batch_f16(value(token_ids), value(data.clone()), value(out))
+                        .generics(vec![
+                            self.cfg.hidden_size.to_string(),
+                            embed_block.to_string(),
+                        ])
+                        .execute(ctx)?
+                };
+                let out: Partition<Tensor<f16>> = result.2;
+                Ok(out.unpartition())
+            }
+            [part] => self.embed_gather_quant_into_ctx(ctx, part, token_ids, out, seqlen),
+            _ => bail!("token embedding weight cannot be row-concat"),
+        }
+    }
+
+    fn embed_gather_quant_into_ctx(
+        &self,
+        ctx: &ExecutionContext,
+        part: &Weight,
+        token_ids: Arc<Tensor<u32>>,
+        out: Tensor<f16>,
+        seqlen: usize,
+    ) -> Result<Tensor<f16>> {
+        let (dtype, quant) = part.as_quantized().with_context(|| {
+            format!("expected quantized embedding weight, got {}", part.dtype())
+        })?;
+        ensure!(
+            part.cols() == self.cfg.hidden_size,
+            "embedding width mismatch: weight cols {}, hidden {}",
+            part.cols(),
+            self.cfg.hidden_size
+        );
+        ensure!(
+            out.shape() == [seqlen as i32, self.cfg.hidden_size as i32],
+            "embedding output shape mismatch, got {:?}",
+            out.shape()
+        );
+        let tile_elems = match dtype {
+            crate::dequant::GgmlType::Q6K => 16usize,
+            crate::dequant::GgmlType::Q8_0
+            | crate::dequant::GgmlType::Q4K
+            | crate::dequant::GgmlType::Q5K => 32usize,
+            other => bail!("unsupported quantized embedding type {other}"),
         };
-        let out: Partition<Tensor<f16>> = result.2;
-        Ok(out.unpartition())
+        let out_part = out.partition([1, tile_elems]);
+        let result = unsafe {
+            match dtype {
+                crate::dequant::GgmlType::Q8_0 => embed_gather_q8_0_f16(
+                    value(token_ids),
+                    value(quant.data.clone()),
+                    value(out_part),
+                )
+                .generics(vec![self.cfg.hidden_size.to_string()])
+                .execute(ctx)?,
+                crate::dequant::GgmlType::Q4K => embed_gather_q4k_f16(
+                    value(token_ids),
+                    value(quant.data.clone()),
+                    value(out_part),
+                )
+                .generics(vec![self.cfg.hidden_size.to_string()])
+                .execute(ctx)?,
+                crate::dequant::GgmlType::Q6K => embed_gather_q6k_f16(
+                    value(token_ids),
+                    value(quant.data.clone()),
+                    value(out_part),
+                )
+                .generics(vec![self.cfg.hidden_size.to_string()])
+                .execute(ctx)?,
+                crate::dequant::GgmlType::Q5K => embed_gather_q5k_f16(
+                    value(token_ids),
+                    value(quant.data.clone()),
+                    value(out_part),
+                )
+                .generics(vec![self.cfg.hidden_size.to_string()])
+                .execute(ctx)?,
+                other => bail!("unsupported quantized embedding type {other}"),
+            }
+        };
+        Ok(result.2.unpartition())
     }
 
     fn gemv_ctx(
-        &self,
+        &mut self,
         ctx: &ExecutionContext,
-        matrix: Arc<Tensor<f16>>,
+        matrix: MatrixWeight,
         vector: Arc<Tensor<f16>>,
     ) -> Result<Tensor<f16>> {
-        ensure!(
-            matrix.shape().len() == 2,
-            "gemv matrix must be rank 2, got {:?}",
-            matrix.shape()
-        );
-        let m = matrix.shape()[0] as usize;
+        let m = matrix.rows();
         let out = alloc_f16_ctx(ctx, &[m])?;
         self.gemv_into_ctx(ctx, matrix, vector, out)
     }
 
     fn gemv_into_ctx(
-        &self,
+        &mut self,
         ctx: &ExecutionContext,
-        matrix: Arc<Tensor<f16>>,
+        matrix: MatrixWeight,
         vector: Arc<Tensor<f16>>,
         out: Tensor<f16>,
     ) -> Result<Tensor<f16>> {
-        ensure!(
-            matrix.shape().len() == 2,
-            "gemv matrix must be rank 2, got {:?}",
-            matrix.shape()
-        );
         ensure!(
             vector.shape().len() == 1,
             "gemv vector must be rank 1, got {:?}",
             vector.shape()
         );
 
-        let m = matrix.shape()[0] as usize;
-        let k = matrix.shape()[1] as usize;
+        let m = matrix.rows();
+        let k = matrix.cols();
         ensure!(k == vector.shape()[0] as usize, "gemv shape mismatch");
         ensure!(
             out.shape() == vec![m as i32],
             "gemv output shape mismatch, got {:?}",
             out.shape()
         );
-        let op = cublas::gemv_f16_op(matrix, vector, out, m, k)?;
-        unsafe { op.execute(ctx)? }
+        if let Some(matrix_f16) = matrix.single_f16() {
+            let op = cublas::gemv_f16_op(matrix_f16.clone(), vector, out, m, k)?;
+            return unsafe { op.execute(ctx)? };
+        }
+
+        if matrix.parts().len() == 1 {
+            return self.gemv_quant_part_into_tensor_ctx(ctx, &matrix.parts()[0], &vector, out);
+        }
+
+        let out = out;
+        let mut out_offset = 0usize;
+        for part in matrix.parts() {
+            let temp = alloc_f16_ctx(ctx, &[part.rows()])?;
+            let temp = self.gemv_quant_part_into_tensor_ctx(ctx, part, &vector, temp)?;
+            unsafe {
+                memcpy_dtod_async::<u8>(
+                    out.device_pointer().cu_deviceptr() + (out_offset * size_of::<f16>()) as u64,
+                    temp.device_pointer().cu_deviceptr(),
+                    part.rows() * size_of::<f16>(),
+                    ctx.get_cuda_stream(),
+                );
+            }
+            out_offset += part.rows();
+        }
+        Ok(out)
     }
 
     fn gemm_ctx(
-        &self,
+        &mut self,
         ctx: &ExecutionContext,
-        matrix: Arc<Tensor<f16>>,
+        matrix: MatrixWeight,
         rhs: Arc<Tensor<f16>>,
     ) -> Result<Tensor<f16>> {
-        ensure!(
-            matrix.shape().len() == 2,
-            "gemm matrix must be rank 2, got {:?}",
-            matrix.shape()
-        );
         ensure!(
             rhs.shape().len() == 2,
             "gemm rhs must be rank 2, got {:?}",
             rhs.shape()
         );
-        let m = matrix.shape()[0] as usize;
+        let m = matrix.rows();
         let n = rhs.shape()[0] as usize;
         let out = alloc_f16_ctx(ctx, &[n, m])?;
         self.gemm_into_ctx(ctx, matrix, rhs, out)
     }
 
     fn gemm_into_ctx(
-        &self,
+        &mut self,
         ctx: &ExecutionContext,
-        matrix: Arc<Tensor<f16>>,
+        matrix: MatrixWeight,
         rhs: Arc<Tensor<f16>>,
         out: Tensor<f16>,
     ) -> Result<Tensor<f16>> {
-        ensure!(
-            matrix.shape().len() == 2,
-            "gemm matrix must be rank 2, got {:?}",
-            matrix.shape()
-        );
         ensure!(
             rhs.shape().len() == 2,
             "gemm rhs must be rank 2, got {:?}",
             rhs.shape()
         );
-        let m = matrix.shape()[0] as usize;
-        let k = matrix.shape()[1] as usize;
+        let m = matrix.rows();
+        let k = matrix.cols();
         let n = rhs.shape()[0] as usize;
         ensure!(k == rhs.shape()[1] as usize, "gemm shape mismatch");
         ensure!(
@@ -4742,22 +4911,45 @@ impl Qwen3Engine {
             "gemm output shape mismatch, got {:?}",
             out.shape()
         );
-        let op = cublas::gemm_f16_op(matrix, rhs, out, m, n, k)?;
-        unsafe { op.execute(ctx)? }
+
+        if n == 1 {
+            let rhs_1d = (&rhs)
+                .reshape(&[k])
+                .map_err(|e| anyhow::anyhow!("reshape gemm rhs to gemv failed: {e:?}"))?;
+            let out_shape = vec![n, m];
+            let out = out
+                .reshape(&[m])
+                .map_err(|e| anyhow::anyhow!("reshape gemm output to gemv failed: {e:?}"))?;
+            let out = self.gemv_into_ctx(ctx, matrix, rhs_1d, out)?;
+            return out
+                .reshape(&out_shape)
+                .map_err(|e| anyhow::anyhow!("restore gemm output shape failed: {e:?}"));
+        }
+
+        if let Some(matrix_f16) = matrix.single_f16() {
+            let op = cublas::gemm_f16_op(matrix_f16.clone(), rhs, out, m, n, k)?;
+            return unsafe { op.execute(ctx)? };
+        }
+
+        ensure!(
+            matrix.parts().len() == 1,
+            "full quantized GEMM with row-concat weights is not supported; graph should use MatMulSlice"
+        );
+        self.gemm_quant_part_into_ctx(ctx, &matrix.parts()[0], rhs, out)
     }
 
     /// Row-sliced GEMM: multiplies input by a contiguous row-range of the weight matrix.
-    /// Uses pointer arithmetic — no weight copy, no extra memory.
+    /// Quantized weights are dequantized into the pooled prefill scratch before cuBLAS GEMM.
     fn gemm_row_slice_into_ctx(
-        &self,
+        &mut self,
         ctx: &ExecutionContext,
-        matrix: Arc<Tensor<f16>>,
+        matrix: MatrixWeight,
         row_offset: usize,
         out_features: usize,
         rhs: Arc<Tensor<f16>>,
         out: Tensor<f16>,
     ) -> Result<Tensor<f16>> {
-        let k = matrix.shape()[1] as usize;
+        let k = matrix.cols();
         let n = rhs.shape()[0] as usize;
         ensure!(
             k == rhs.shape()[1] as usize,
@@ -4768,8 +4960,583 @@ impl Qwen3Engine {
             "gemm_row_slice output shape mismatch: expected [{n}, {out_features}], got {:?}",
             out.shape()
         );
-        let op = cublas::gemm_f16_row_slice_op(matrix, row_offset, rhs, out, out_features, n, k)?;
-        unsafe { op.execute(ctx)? }
+        if let Some(matrix_f16) = matrix.single_f16() {
+            let op = cublas::gemm_f16_row_slice_op(
+                matrix_f16.clone(),
+                row_offset,
+                rhs,
+                out,
+                out_features,
+                n,
+                k,
+            )?;
+            return unsafe { op.execute(ctx)? };
+        }
+
+        let parts = matrix.row_parts_for_slice(row_offset, out_features)?;
+        ensure!(
+            parts.len() == 1 && parts[0].0 == 0,
+            "quantized row-sliced GEMM expects one complete projection part"
+        );
+        self.gemm_quant_part_into_ctx(ctx, parts[0].1, rhs, out)
+    }
+
+    fn gemv_quant_part_into_tensor_ctx(
+        &self,
+        ctx: &ExecutionContext,
+        part: &Weight,
+        vector: &Arc<Tensor<f16>>,
+        out: Tensor<f16>,
+    ) -> Result<Tensor<f16>> {
+        let (dtype, quant) = part
+            .as_quantized()
+            .with_context(|| format!("expected quantized GEMV weight, got {}", part.dtype()))?;
+        ensure!(
+            part.cols() == vector.shape()[0] as usize,
+            "quantized GEMV shape mismatch"
+        );
+        ensure!(
+            out.shape() == [part.rows() as i32],
+            "quantized GEMV output shape mismatch: got {:?}, expected [{}]",
+            out.shape(),
+            part.rows()
+        );
+        ensure!(part.cols() <= i32::MAX as usize, "GEMV K too large");
+        let out_part = out.partition([1]);
+        let result = unsafe {
+            match dtype {
+                crate::dequant::GgmlType::Q8_0 => gemv_q8_0_f16(
+                    value(out_part),
+                    value(quant.data.clone()),
+                    value(vector.clone()),
+                )
+                .generics(vec![part.cols().to_string()])
+                .grid((part.rows() as u32, 1u32, 1u32))
+                .execute(ctx)?,
+                crate::dequant::GgmlType::Q4K => gemv_q4k_f16(
+                    value(out_part),
+                    value(quant.data.clone()),
+                    value(vector.clone()),
+                )
+                .generics(vec![part.cols().to_string()])
+                .grid((part.rows() as u32, 1u32, 1u32))
+                .execute(ctx)?,
+                crate::dequant::GgmlType::Q6K => gemv_q6k_f16(
+                    value(out_part),
+                    value(quant.data.clone()),
+                    value(vector.clone()),
+                )
+                .generics(vec![part.cols().to_string()])
+                .grid((part.rows() as u32, 1u32, 1u32))
+                .execute(ctx)?,
+                crate::dequant::GgmlType::Q5K => gemv_q5k_f16(
+                    value(out_part),
+                    value(quant.data.clone()),
+                    value(vector.clone()),
+                )
+                .generics(vec![part.cols().to_string()])
+                .grid((part.rows() as u32, 1u32, 1u32))
+                .execute(ctx)?,
+                other => bail!("unsupported quantized GEMV type {other}"),
+            }
+        };
+        Ok(result.0.unpartition())
+    }
+
+    fn gemm_quant_part_into_ctx(
+        &mut self,
+        ctx: &ExecutionContext,
+        part: &Weight,
+        rhs: Arc<Tensor<f16>>,
+        out: Tensor<f16>,
+    ) -> Result<Tensor<f16>> {
+        let m = part.rows();
+        let k = part.cols();
+        let n = rhs.shape()[0] as usize;
+        ensure!(
+            rhs.shape() == [n as i32, k as i32],
+            "quantized GEMM rhs shape mismatch: got {:?}, expected [{n}, {k}]",
+            rhs.shape()
+        );
+        ensure!(
+            out.shape() == [n as i32, m as i32],
+            "quantized GEMM output shape mismatch: got {:?}, expected [{n}, {m}]",
+            out.shape()
+        );
+
+        let mut scratch = self
+            .quant_prefill_scratch
+            .take()
+            .context("quantized prefill scratch buffer is not allocated")?;
+        let result = (|| -> Result<()> {
+            self.dequant_weight_to_scratch_ctx(ctx, part, &mut scratch)?;
+            unsafe {
+                cublas::GemmInPlace {
+                    matrix: &scratch,
+                    rhs: &rhs,
+                    out: &out,
+                    m: m as i32,
+                    n: n as i32,
+                    k: k as i32,
+                }
+                .execute(ctx)?;
+            }
+            Ok(())
+        })();
+        self.quant_prefill_scratch = Some(scratch);
+        result?;
+        Ok(out)
+    }
+
+    fn dequant_weight_to_scratch_ctx(
+        &self,
+        ctx: &ExecutionContext,
+        part: &Weight,
+        scratch: &mut Tensor<f16>,
+    ) -> Result<()> {
+        let (dtype, quant) = part
+            .as_quantized()
+            .with_context(|| format!("expected quantized dequant weight, got {}", part.dtype()))?;
+        let elems = part.elem_count();
+        ensure!(
+            elems <= scratch.shape()[0] as usize,
+            "quantized prefill scratch too small: need {elems} elems, have {}",
+            scratch.shape()[0]
+        );
+        let (tile_elems, num_tiles) = match dtype {
+            crate::dequant::GgmlType::Q8_0 => (32usize, elems / 32usize),
+            crate::dequant::GgmlType::Q4K | crate::dequant::GgmlType::Q5K => {
+                (32usize, elems / 32usize)
+            }
+            crate::dequant::GgmlType::Q6K => (16usize, elems / 16usize),
+            other => bail!("unsupported quantized dequant type {other}"),
+        };
+        ensure!(
+            elems.is_multiple_of(tile_elems),
+            "dequant elems {elems} not divisible by tile size {tile_elems}"
+        );
+        ensure!(
+            num_tiles <= i32::MAX as usize,
+            "dequant tile count too large"
+        );
+        let num_tiles = num_tiles as i32;
+        unsafe {
+            match dtype {
+                crate::dequant::GgmlType::Q8_0 => dequant_q8_0_to_f16(
+                    (&mut *scratch).partition([tile_elems]),
+                    &*quant.data,
+                    num_tiles,
+                )
+                .execute(ctx)?,
+                crate::dequant::GgmlType::Q4K => dequant_q4k_to_f16(
+                    (&mut *scratch).partition([tile_elems]),
+                    &*quant.data,
+                    num_tiles,
+                )
+                .execute(ctx)?,
+                crate::dequant::GgmlType::Q6K => dequant_q6k_to_f16(
+                    (&mut *scratch).partition([tile_elems]),
+                    &*quant.data,
+                    num_tiles,
+                )
+                .execute(ctx)?,
+                crate::dequant::GgmlType::Q5K => dequant_q5k_to_f16(
+                    (&mut *scratch).partition([tile_elems]),
+                    &*quant.data,
+                    num_tiles,
+                )
+                .execute(ctx)?,
+                other => bail!("unsupported quantized dequant type {other}"),
+            }
+        };
+        Ok(())
+    }
+
+    fn decode_embedding_sync_on(
+        &self,
+        stream: &Arc<cuda_core::Stream>,
+        token_ids: &Tensor<u32>,
+        out: &mut Tensor<f16>,
+        embed_block: usize,
+    ) -> Result<()> {
+        match self.embed_tokens.parts() {
+            [Weight::F16 { data, .. }] => {
+                embedding_batch_f16(token_ids, &**data, out.partition([1, embed_block]))
+                    .generics(vec![
+                        self.cfg.hidden_size.to_string(),
+                        embed_block.to_string(),
+                    ])
+                    .sync_on(stream)
+                    .map_err(|e| anyhow::anyhow!("decode embedding failed: {e:?}"))?;
+            }
+            [part] => {
+                let (dtype, quant) = part
+                    .as_quantized()
+                    .context("expected quantized embedding")?;
+                let tile = if dtype == crate::dequant::GgmlType::Q6K {
+                    16usize
+                } else {
+                    32usize
+                };
+                unsafe {
+                    match dtype {
+                        crate::dequant::GgmlType::Q8_0 => {
+                            embed_gather_q8_0_f16(
+                                token_ids,
+                                &*quant.data,
+                                out.partition([1, tile]),
+                            )
+                            .generics(vec![self.cfg.hidden_size.to_string()])
+                            .sync_on(stream)
+                            .map_err(|e| anyhow::anyhow!("decode q8_0 embedding failed: {e:?}"))?;
+                        }
+                        crate::dequant::GgmlType::Q4K => {
+                            embed_gather_q4k_f16(token_ids, &*quant.data, out.partition([1, tile]))
+                                .generics(vec![self.cfg.hidden_size.to_string()])
+                                .sync_on(stream)
+                                .map_err(|e| {
+                                    anyhow::anyhow!("decode q4k embedding failed: {e:?}")
+                                })?;
+                        }
+                        crate::dequant::GgmlType::Q6K => {
+                            embed_gather_q6k_f16(token_ids, &*quant.data, out.partition([1, tile]))
+                                .generics(vec![self.cfg.hidden_size.to_string()])
+                                .sync_on(stream)
+                                .map_err(|e| {
+                                    anyhow::anyhow!("decode q6k embedding failed: {e:?}")
+                                })?;
+                        }
+                        crate::dequant::GgmlType::Q5K => {
+                            embed_gather_q5k_f16(token_ids, &*quant.data, out.partition([1, tile]))
+                                .generics(vec![self.cfg.hidden_size.to_string()])
+                                .sync_on(stream)
+                                .map_err(|e| {
+                                    anyhow::anyhow!("decode q5k embedding failed: {e:?}")
+                                })?;
+                        }
+                        other => bail!("unsupported quantized embedding type {other}"),
+                    }
+                }
+            }
+            _ => bail!("token embedding weight cannot be row-concat"),
+        }
+        Ok(())
+    }
+
+    fn decode_embedding_record_scope(
+        &self,
+        s: &Scope,
+        token_ids: &Tensor<u32>,
+        out: &mut Tensor<f16>,
+        embed_block: usize,
+    ) -> std::result::Result<(), DeviceError> {
+        match self.embed_tokens.parts() {
+            [Weight::F16 { data, .. }] => {
+                s.record(
+                    embedding_batch_f16(token_ids, &**data, out.partition([1, embed_block]))
+                        .generics(vec![
+                            self.cfg.hidden_size.to_string(),
+                            embed_block.to_string(),
+                        ]),
+                )?;
+            }
+            [part] => {
+                let (dtype, quant) = part
+                    .as_quantized()
+                    .ok_or_else(|| DeviceError::Internal("expected quantized embedding".into()))?;
+                let tile = if dtype == crate::dequant::GgmlType::Q6K {
+                    16usize
+                } else {
+                    32usize
+                };
+                match dtype {
+                    crate::dequant::GgmlType::Q8_0 => {
+                        s.record(
+                            unsafe {
+                                embed_gather_q8_0_f16(
+                                    token_ids,
+                                    &*quant.data,
+                                    out.partition([1, tile]),
+                                )
+                            }
+                            .generics(vec![self.cfg.hidden_size.to_string()]),
+                        )?;
+                    }
+                    crate::dequant::GgmlType::Q4K => {
+                        s.record(
+                            unsafe {
+                                embed_gather_q4k_f16(
+                                    token_ids,
+                                    &*quant.data,
+                                    out.partition([1, tile]),
+                                )
+                            }
+                            .generics(vec![self.cfg.hidden_size.to_string()]),
+                        )?;
+                    }
+                    crate::dequant::GgmlType::Q6K => {
+                        s.record(
+                            unsafe {
+                                embed_gather_q6k_f16(
+                                    token_ids,
+                                    &*quant.data,
+                                    out.partition([1, tile]),
+                                )
+                            }
+                            .generics(vec![self.cfg.hidden_size.to_string()]),
+                        )?;
+                    }
+                    crate::dequant::GgmlType::Q5K => {
+                        s.record(
+                            unsafe {
+                                embed_gather_q5k_f16(
+                                    token_ids,
+                                    &*quant.data,
+                                    out.partition([1, tile]),
+                                )
+                            }
+                            .generics(vec![self.cfg.hidden_size.to_string()]),
+                        )?;
+                    }
+                    other => {
+                        return Err(DeviceError::Internal(format!(
+                            "unsupported quantized embedding type {other}"
+                        )));
+                    }
+                }
+            }
+            _ => {
+                return Err(DeviceError::Internal(
+                    "token embedding weight cannot be row-concat".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn decode_gemv_sync_on(
+        &self,
+        stream: &Arc<cuda_core::Stream>,
+        matrix: &MatrixWeight,
+        vector_f16: &Tensor<f16>,
+        vector_quant: &TensorView<'_, f16>,
+        out: &mut Tensor<f16>,
+        tmp: &mut Tensor<f16>,
+        label: &str,
+    ) -> Result<()> {
+        if let Some(matrix_f16) = matrix.single_f16() {
+            cublas::GemvInPlace {
+                matrix: &**matrix_f16,
+                vector: vector_f16,
+                out,
+                m: matrix.rows() as i32,
+                k: matrix.cols() as i32,
+            }
+            .sync_on(stream)
+            .map_err(|e| anyhow::anyhow!("{label} f16 gemv failed: {e:?}"))?;
+            return Ok(());
+        }
+
+        if matrix.parts().len() == 1
+            && out.shape().len() == 1
+            && out.shape()[0] as usize == matrix.rows()
+        {
+            self.quant_gemv_part_sync_on(stream, &matrix.parts()[0], vector_quant, out, label)?;
+            return Ok(());
+        }
+
+        let mut out_offset = 0usize;
+        for part in matrix.parts() {
+            ensure!(
+                tmp.shape()[0] as usize >= part.rows(),
+                "decode quant GEMV tmp too small for {label}: need {}, have {}",
+                part.rows(),
+                tmp.shape()[0]
+            );
+            self.quant_gemv_part_sync_on(stream, part, vector_quant, tmp, label)?;
+            unsafe {
+                memcpy_dtod_async::<u8>(
+                    out.device_pointer().cu_deviceptr() + (out_offset * size_of::<f16>()) as u64,
+                    tmp.device_pointer().cu_deviceptr(),
+                    part.rows() * size_of::<f16>(),
+                    stream,
+                );
+            }
+            out_offset += part.rows();
+        }
+        Ok(())
+    }
+
+    fn decode_gemv_record_scope(
+        &self,
+        s: &Scope,
+        matrix: &MatrixWeight,
+        vector_f16: &Tensor<f16>,
+        vector_quant: &TensorView<'_, f16>,
+        out: &mut Tensor<f16>,
+        tmp: &mut Tensor<f16>,
+        label: &str,
+    ) -> std::result::Result<(), DeviceError> {
+        if let Some(matrix_f16) = matrix.single_f16() {
+            s.record(cublas::GemvInPlace {
+                matrix: &**matrix_f16,
+                vector: vector_f16,
+                out,
+                m: matrix.rows() as i32,
+                k: matrix.cols() as i32,
+            })?;
+            return Ok(());
+        }
+
+        if matrix.parts().len() == 1
+            && out.shape().len() == 1
+            && out.shape()[0] as usize == matrix.rows()
+        {
+            self.quant_gemv_part_record_scope(s, &matrix.parts()[0], vector_quant, out, label)?;
+            return Ok(());
+        }
+
+        let mut out_offset = 0usize;
+        for part in matrix.parts() {
+            if (tmp.shape()[0] as usize) < part.rows() {
+                return Err(DeviceError::Internal(format!(
+                    "decode quant GEMV tmp too small for {label}: need {}, have {}",
+                    part.rows(),
+                    tmp.shape()[0]
+                )));
+            }
+            self.quant_gemv_part_record_scope(s, part, vector_quant, tmp, label)?;
+            let dst = out.device_pointer().cu_deviceptr() + (out_offset * size_of::<f16>()) as u64;
+            let src = tmp.device_pointer().cu_deviceptr();
+            let bytes = part.rows() * size_of::<f16>();
+            s.record(KernelGraphOp(move |ctx: &ExecutionContext| {
+                unsafe { memcpy_dtod_async::<u8>(dst, src, bytes, ctx.get_cuda_stream()) };
+                Ok(())
+            }))?;
+            out_offset += part.rows();
+        }
+        Ok(())
+    }
+
+    fn quant_gemv_part_record_scope(
+        &self,
+        s: &Scope,
+        part: &Weight,
+        vector: &TensorView<'_, f16>,
+        out: &mut Tensor<f16>,
+        label: &str,
+    ) -> std::result::Result<(), DeviceError> {
+        let (dtype, quant) = part.as_quantized().ok_or_else(|| {
+            DeviceError::Internal(format!("{label}: expected quantized GEMV part"))
+        })?;
+        match dtype {
+            crate::dequant::GgmlType::Q8_0 => {
+                s.record(
+                    unsafe {
+                        gemv_q8_0_f16_into(
+                            out.partition([1]),
+                            &*quant.data,
+                            vector,
+                            part.rows() as i32,
+                        )
+                    }
+                    .generics(vec![part.cols().to_string()]),
+                )?;
+            }
+            crate::dequant::GgmlType::Q4K => {
+                s.record(
+                    unsafe {
+                        gemv_q4k_f16_into(
+                            out.partition([1]),
+                            &*quant.data,
+                            vector,
+                            part.rows() as i32,
+                        )
+                    }
+                    .generics(vec![part.cols().to_string()]),
+                )?;
+            }
+            crate::dequant::GgmlType::Q6K => {
+                s.record(
+                    unsafe {
+                        gemv_q6k_f16_into(
+                            out.partition([1]),
+                            &*quant.data,
+                            vector,
+                            part.rows() as i32,
+                        )
+                    }
+                    .generics(vec![part.cols().to_string()]),
+                )?;
+            }
+            crate::dequant::GgmlType::Q5K => {
+                s.record(
+                    unsafe {
+                        gemv_q5k_f16_into(
+                            out.partition([1]),
+                            &*quant.data,
+                            vector,
+                            part.rows() as i32,
+                        )
+                    }
+                    .generics(vec![part.cols().to_string()]),
+                )?;
+            }
+            other => {
+                return Err(DeviceError::Internal(format!(
+                    "{label}: unsupported quantized GEMV type {other}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn quant_gemv_part_sync_on(
+        &self,
+        stream: &Arc<cuda_core::Stream>,
+        part: &Weight,
+        vector: &TensorView<'_, f16>,
+        out: &mut Tensor<f16>,
+        label: &str,
+    ) -> Result<()> {
+        let (dtype, quant) = part
+            .as_quantized()
+            .context("expected quantized GEMV part")?;
+        unsafe {
+            match dtype {
+                crate::dequant::GgmlType::Q8_0 => {
+                    gemv_q8_0_f16_into(
+                        out.partition([1]),
+                        &*quant.data,
+                        vector,
+                        part.rows() as i32,
+                    )
+                    .generics(vec![part.cols().to_string()])
+                    .sync_on(stream)
+                    .map_err(|e| anyhow::anyhow!("{label} q8_0 gemv failed: {e:?}"))?;
+                }
+                crate::dequant::GgmlType::Q4K => {
+                    gemv_q4k_f16_into(out.partition([1]), &*quant.data, vector, part.rows() as i32)
+                        .generics(vec![part.cols().to_string()])
+                        .sync_on(stream)
+                        .map_err(|e| anyhow::anyhow!("{label} q4k gemv failed: {e:?}"))?;
+                }
+                crate::dequant::GgmlType::Q6K => {
+                    gemv_q6k_f16_into(out.partition([1]), &*quant.data, vector, part.rows() as i32)
+                        .generics(vec![part.cols().to_string()])
+                        .sync_on(stream)
+                        .map_err(|e| anyhow::anyhow!("{label} q6k gemv failed: {e:?}"))?;
+                }
+                crate::dequant::GgmlType::Q5K => {
+                    gemv_q5k_f16_into(out.partition([1]), &*quant.data, vector, part.rows() as i32)
+                        .generics(vec![part.cols().to_string()])
+                        .sync_on(stream)
+                        .map_err(|e| anyhow::anyhow!("{label} q5k gemv failed: {e:?}"))?;
+                }
+                other => bail!("unsupported quantized GEMV type {other}"),
+            }
+        }
+        Ok(())
     }
 
     fn add_2d_ctx(
@@ -5879,42 +6646,65 @@ fn load_layer_weight(
         .with_context(|| format!("failed to load {human_name} ({name})"))
 }
 
-/// Concatenates multiple rank-2 weight tensors along dimension 0 (rows) on the GPU.
-/// All inputs must have the same number of columns.
-/// Returns an Arc<Tensor> of shape [sum_of_rows, cols].
+fn load_layer_matrix_weight(
+    loader: &WeightLoader,
+    stream: &Arc<cuda_core::Stream>,
+    idx: usize,
+    suffix: &str,
+    human_name: &str,
+) -> Result<MatrixWeight> {
+    let name = format!("model.layers.{idx}.{suffix}");
+    loader
+        .load_device_weight(&name, stream)
+        .with_context(|| format!("failed to load {human_name} ({name})"))
+}
+
+/// Concatenates multiple rank-2 weight tensors along dimension 0 (rows).
+/// F16 tensors keep the old contiguous GPU copy. Quantized tensors stay as
+/// logical row-concat parts so each raw GGUF buffer remains block-for-block.
 fn concat_weight_rows_2d(
     stream: &Arc<cuda_core::Stream>,
-    tensors: &[&Arc<Tensor<f16>>],
-) -> Result<Arc<Tensor<f16>>> {
+    tensors: &[&MatrixWeight],
+) -> Result<MatrixWeight> {
     ensure!(
         !tensors.is_empty(),
         "concat_weight_rows_2d requires at least one tensor"
     );
-    let cols = tensors[0].shape()[1] as usize;
+    let cols = tensors[0].cols();
+    let all_single_f16 = tensors.iter().all(|t| t.single_f16().is_some());
+    if !all_single_f16 {
+        let mut parts = Vec::new();
+        for t in tensors {
+            ensure!(
+                t.cols() == cols,
+                "concat_weight_rows_2d: mismatched columns {} vs {}",
+                t.cols(),
+                cols
+            );
+            parts.extend(t.parts().iter().cloned());
+        }
+        return MatrixWeight::row_concat(parts);
+    }
+
     let mut total_rows = 0usize;
     let mut src_parts: Vec<(u64, usize)> = Vec::with_capacity(tensors.len());
     for t in tensors {
+        let f16 = t.single_f16().context("expected f16 tensor")?;
         ensure!(
-            t.shape().len() == 2,
-            "concat_weight_rows_2d expects rank-2 tensors, got {:?}",
-            t.shape()
-        );
-        ensure!(
-            t.shape()[1] as usize == cols,
+            t.cols() == cols,
             "concat_weight_rows_2d: mismatched columns {} vs {}",
-            t.shape()[1],
+            t.cols(),
             cols
         );
-        let t_rows = t.shape()[0] as usize;
+        let t_rows = t.rows();
         let t_bytes = t_rows * cols * size_of::<f16>();
-        src_parts.push((t.device_pointer().cu_deviceptr(), t_bytes));
+        src_parts.push((f16.device_pointer().cu_deviceptr(), t_bytes));
         total_rows += t_rows;
     }
 
     let total_elements = total_rows * cols;
     let total_bytes = total_elements * size_of::<f16>();
 
-    // Allocate the merged tensor and copy each source into it.
     let ctx = cuda_async::device_operation::ExecutionContext::new(stream.clone());
     let dst_ptr = unsafe { cuda_core::malloc_async(total_bytes, stream) };
     let mut offset_bytes = 0u64;
@@ -5933,7 +6723,40 @@ fn concat_weight_rows_2d(
             vec![cols as i32, 1],
         )
     };
-    Ok(Arc::new(merged))
+    Ok(MatrixWeight::single(Weight::f16(Arc::new(merged))?))
+}
+
+fn max_transformer_quant_weight_elems(layers: &[Layer]) -> Option<usize> {
+    layers
+        .iter()
+        .flat_map(|layer| {
+            [
+                &layer.weights.qkv_proj,
+                &layer.weights.o_proj,
+                &layer.weights.gate_up_proj,
+                &layer.weights.down_proj,
+            ]
+        })
+        .filter_map(MatrixWeight::max_quantized_elems)
+        .max()
+}
+
+fn max_decode_quant_gemv_part_rows(layers: &[Layer]) -> usize {
+    layers
+        .iter()
+        .flat_map(|layer| {
+            [
+                &layer.weights.qkv_proj,
+                &layer.weights.o_proj,
+                &layer.weights.gate_up_proj,
+                &layer.weights.down_proj,
+            ]
+        })
+        .flat_map(|weight| weight.parts().iter())
+        .filter(|part| part.is_quantized())
+        .map(Weight::rows)
+        .max()
+        .unwrap_or(1)
 }
 
 fn argmax_f16(values: &[f16]) -> usize {
