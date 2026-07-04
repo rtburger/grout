@@ -8,8 +8,11 @@ use cutile::api::{self, DeviceOpReshape};
 use cutile::core::f16;
 use cutile::tensor::{IntoPartition, ToHostVec};
 use cutile::tile_kernel::TileKernel;
-use grout::dequant::{GgmlType, dequantize_to_f32};
-use grout::kernels::{add_2d_f16, gemv_q4k_f16, gemv_q5k_f16, gemv_q6k_f16, gemv_q8_0_f16};
+use grout::dequant::{GgmlType, dequantize_to_f16, dequantize_to_f32};
+use grout::kernels::{
+    add_2d_f16, dequant_q4k_to_f16, dequant_q5k_to_f16, dequant_q6k_to_f16, dequant_q8_0_to_f16,
+    gemv_q4k_f16, gemv_q5k_f16, gemv_q6k_f16, gemv_q8_0_f16,
+};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::sync::Arc;
 
@@ -121,6 +124,66 @@ fn gemv_q5k_f16_matches_cpu() -> Result<()> {
     Ok(())
 }
 
+#[test]
+#[ignore = "GPU quantized dequant integration: run with `cargo test dequant_q8_0_to_f16_matches_cpu -- --ignored` and a visible CUDA device"]
+fn dequant_q8_0_to_f16_matches_cpu() -> Result<()> {
+    if !cuda_available()? {
+        return Ok(());
+    }
+
+    let device = Device::new(0)?;
+    let stream = device.new_stream()?;
+    for (rows, k, checked_rows) in dequant_prefill_shapes() {
+        run_dequant_q8_0_case(&stream, rows, k, checked_rows)?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "GPU quantized dequant integration: run with `cargo test dequant_q4k_to_f16_matches_cpu -- --ignored` and a visible CUDA device"]
+fn dequant_q4k_to_f16_matches_cpu() -> Result<()> {
+    if !cuda_available()? {
+        return Ok(());
+    }
+
+    let device = Device::new(0)?;
+    let stream = device.new_stream()?;
+    for (rows, k, checked_rows) in dequant_prefill_shapes() {
+        run_dequant_q4k_case(&stream, rows, k, checked_rows)?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "GPU quantized dequant integration: run with `cargo test dequant_q6k_to_f16_matches_cpu -- --ignored` and a visible CUDA device"]
+fn dequant_q6k_to_f16_matches_cpu() -> Result<()> {
+    if !cuda_available()? {
+        return Ok(());
+    }
+
+    let device = Device::new(0)?;
+    let stream = device.new_stream()?;
+    for (rows, k, checked_rows) in dequant_prefill_shapes() {
+        run_dequant_q6k_case(&stream, rows, k, checked_rows)?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "GPU quantized dequant integration: run with `cargo test dequant_q5k_to_f16_matches_cpu -- --ignored` and a visible CUDA device"]
+fn dequant_q5k_to_f16_matches_cpu() -> Result<()> {
+    if !cuda_available()? {
+        return Ok(());
+    }
+
+    let device = Device::new(0)?;
+    let stream = device.new_stream()?;
+    for (rows, k, checked_rows) in dequant_prefill_shapes() {
+        run_dequant_q5k_case(&stream, rows, k, checked_rows)?;
+    }
+    Ok(())
+}
+
 fn quant_gemv_shapes() -> [(usize, usize, Option<Vec<usize>>); 5] {
     [
         (3usize, 2560usize, None),
@@ -128,6 +191,17 @@ fn quant_gemv_shapes() -> [(usize, usize, Option<Vec<usize>>); 5] {
         (2, 9728, None),
         (2, 12288, None),
         (151_936, 2560, Some(vec![0usize, 1, 777, 75_968, 151_935])),
+    ]
+}
+
+fn dequant_prefill_shapes() -> [(usize, usize, Option<Vec<usize>>); 5] {
+    [
+        (3usize, 2560usize, None),
+        (4, 4096, None),
+        (2, 9728, None),
+        (2, 12288, None),
+        // Largest 8B transformer matrix scratch (~100 MB f16). LM head is intentionally absent.
+        (12_288, 4096, Some(vec![0usize, 1, 777, 12_287])),
     ]
 }
 
@@ -293,6 +367,198 @@ fn run_q5k_case(
     for (row, expected) in expected {
         let actual = actual[row].to_f32();
         assert_close(row, actual, expected)?;
+    }
+    Ok(())
+}
+
+const MAX_TRANSFORMER_MATRIX_ELEMS_8B: usize = 12_288 * 4_096;
+
+fn run_dequant_q8_0_case(
+    stream: &Arc<cuda_core::Stream>,
+    rows: usize,
+    k: usize,
+    checked_rows: Option<Vec<usize>>,
+) -> Result<()> {
+    let dtype = GgmlType::Q8_0;
+    let tile_elems = 32usize;
+    let raw = make_quantized_matrix::<BlockQ8_0>(dtype, rows, k, checked_rows.as_deref())?;
+    let scratch_elems = scratch_elems_for(rows * k, tile_elems);
+    let weights_host = Arc::new(raw.clone());
+    let weights = Arc::new(
+        api::copy_host_vec_to_device(&weights_host)
+            .reshape(&[weights_host.len()])
+            .sync_on(stream)?,
+    );
+    let scratch = api::zeros::<f16>(&[scratch_elems]).sync_on(stream)?;
+    let num_tiles = (rows * k / tile_elems) as i32;
+
+    let result = unsafe {
+        dequant_q8_0_to_f16(
+            value(scratch.partition([tile_elems])),
+            value(weights),
+            value(num_tiles),
+        )
+    }
+    .sync_on(stream)?;
+    let scratch = result.0.unpartition();
+    let actual = scratch.to_host_vec().sync_on(stream)?;
+    compare_dequant_rows(dtype, &raw, rows, k, &actual, checked_rows.as_deref())?;
+    assert_scratch_tail_zero(rows * k, &actual)?;
+    Ok(())
+}
+
+fn run_dequant_q4k_case(
+    stream: &Arc<cuda_core::Stream>,
+    rows: usize,
+    k: usize,
+    checked_rows: Option<Vec<usize>>,
+) -> Result<()> {
+    let dtype = GgmlType::Q4K;
+    let tile_elems = 32usize;
+    let raw = make_quantized_matrix::<BlockQ4K>(dtype, rows, k, checked_rows.as_deref())?;
+    let scratch_elems = scratch_elems_for(rows * k, tile_elems);
+    let weights_host = Arc::new(raw.clone());
+    let weights = Arc::new(
+        api::copy_host_vec_to_device(&weights_host)
+            .reshape(&[weights_host.len()])
+            .sync_on(stream)?,
+    );
+    let scratch = api::zeros::<f16>(&[scratch_elems]).sync_on(stream)?;
+    let num_tiles = (rows * k / tile_elems) as i32;
+
+    let result = unsafe {
+        dequant_q4k_to_f16(
+            value(scratch.partition([tile_elems])),
+            value(weights),
+            value(num_tiles),
+        )
+    }
+    .sync_on(stream)?;
+    let scratch = result.0.unpartition();
+    let actual = scratch.to_host_vec().sync_on(stream)?;
+    compare_dequant_rows(dtype, &raw, rows, k, &actual, checked_rows.as_deref())?;
+    assert_scratch_tail_zero(rows * k, &actual)?;
+    Ok(())
+}
+
+fn run_dequant_q6k_case(
+    stream: &Arc<cuda_core::Stream>,
+    rows: usize,
+    k: usize,
+    checked_rows: Option<Vec<usize>>,
+) -> Result<()> {
+    let dtype = GgmlType::Q6K;
+    let tile_elems = 16usize;
+    let raw = make_quantized_matrix::<BlockQ6K>(dtype, rows, k, checked_rows.as_deref())?;
+    let scratch_elems = scratch_elems_for(rows * k, tile_elems);
+    let weights_host = Arc::new(raw.clone());
+    let weights = Arc::new(
+        api::copy_host_vec_to_device(&weights_host)
+            .reshape(&[weights_host.len()])
+            .sync_on(stream)?,
+    );
+    let scratch = api::zeros::<f16>(&[scratch_elems]).sync_on(stream)?;
+    let num_tiles = (rows * k / tile_elems) as i32;
+
+    let result = unsafe {
+        dequant_q6k_to_f16(
+            value(scratch.partition([tile_elems])),
+            value(weights),
+            value(num_tiles),
+        )
+    }
+    .sync_on(stream)?;
+    let scratch = result.0.unpartition();
+    let actual = scratch.to_host_vec().sync_on(stream)?;
+    compare_dequant_rows(dtype, &raw, rows, k, &actual, checked_rows.as_deref())?;
+    assert_scratch_tail_zero(rows * k, &actual)?;
+    Ok(())
+}
+
+fn run_dequant_q5k_case(
+    stream: &Arc<cuda_core::Stream>,
+    rows: usize,
+    k: usize,
+    checked_rows: Option<Vec<usize>>,
+) -> Result<()> {
+    let dtype = GgmlType::Q5K;
+    let tile_elems = 32usize;
+    let raw = make_quantized_matrix::<BlockQ5K>(dtype, rows, k, checked_rows.as_deref())?;
+    let scratch_elems = scratch_elems_for(rows * k, tile_elems);
+    let weights_host = Arc::new(raw.clone());
+    let weights = Arc::new(
+        api::copy_host_vec_to_device(&weights_host)
+            .reshape(&[weights_host.len()])
+            .sync_on(stream)?,
+    );
+    let scratch = api::zeros::<f16>(&[scratch_elems]).sync_on(stream)?;
+    let num_tiles = (rows * k / tile_elems) as i32;
+
+    let result = unsafe {
+        dequant_q5k_to_f16(
+            value(scratch.partition([tile_elems])),
+            value(weights),
+            value(num_tiles),
+        )
+    }
+    .sync_on(stream)?;
+    let scratch = result.0.unpartition();
+    let actual = scratch.to_host_vec().sync_on(stream)?;
+    compare_dequant_rows(dtype, &raw, rows, k, &actual, checked_rows.as_deref())?;
+    assert_scratch_tail_zero(rows * k, &actual)?;
+    Ok(())
+}
+
+fn scratch_elems_for(matrix_elems: usize, tile_elems: usize) -> usize {
+    if matrix_elems == MAX_TRANSFORMER_MATRIX_ELEMS_8B {
+        return MAX_TRANSFORMER_MATRIX_ELEMS_8B;
+    }
+    let with_tail = matrix_elems + tile_elems;
+    with_tail.div_ceil(tile_elems) * tile_elems
+}
+
+fn compare_dequant_rows(
+    dtype: GgmlType,
+    raw: &[u8],
+    rows: usize,
+    k: usize,
+    actual: &[f16],
+    checked_rows: Option<&[usize]>,
+) -> Result<()> {
+    let row_bytes = k / dtype.block_size() * dtype.type_size();
+    let rows_to_check: Vec<usize> = match checked_rows {
+        Some(rows) => rows.to_vec(),
+        None => (0..rows).collect(),
+    };
+    for row in rows_to_check {
+        let raw_start = row * row_bytes;
+        let expected =
+            dequantize_to_f16(dtype, &raw[raw_start..raw_start + row_bytes], k, "test row")?;
+        let out_start = row * k;
+        for (col, (actual, expected)) in actual[out_start..out_start + k]
+            .iter()
+            .zip(expected.iter())
+            .enumerate()
+        {
+            let actual = actual.to_f32();
+            let expected = expected.to_f32();
+            let tol = 1.0e-2f32 * expected.abs().max(1.0);
+            ensure!(
+                (actual - expected).abs() <= tol,
+                "dequant row {row} col {col}: actual {actual} expected {expected} tolerance {tol}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn assert_scratch_tail_zero(matrix_elems: usize, actual: &[f16]) -> Result<()> {
+    if matrix_elems < actual.len() {
+        let value = actual[matrix_elems].to_f32();
+        ensure!(
+            value == 0.0,
+            "dequant kernel wrote past matrix prefix: tail value {value} at {matrix_elems}"
+        );
     }
     Ok(())
 }

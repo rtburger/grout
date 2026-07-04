@@ -4,6 +4,7 @@ pub mod dequant;
 mod flash_decode;
 pub mod gguf;
 pub mod loader;
+pub mod quant_scratch;
 
 pub mod kernels;
 pub mod model;
