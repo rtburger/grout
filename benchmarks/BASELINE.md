@@ -196,3 +196,34 @@ The harness reads tensor shapes and dtypes from each GGUF tensor table; no model
 - CUDA 13.3 `tileiras` compiled and launched the Grout kernels on the 595.58.03 driver.
 - llama.cpp used 2 warmups before measured reps. Timed reps were stable after warmup.
 - pi-ai-candle first generation after model load was slower; measured reps after 1 warmup were stable.
+
+## Phase 2 Q8_0 raw decode-GEMV checkpoint
+
+Run mode for this synthetic Q8_0 checkpoint: desktop/display-attached.
+
+Version block:
+
+- Driver: 595.58.03
+- CUDA toolkit: Arch `cuda` package 13.3.1-1; `/opt/cuda/bin/nvcc` CUDA 13.3, V13.3.73
+- tileiras: `/opt/cuda/bin/tileiras`, CUDA Tile IR assembler 13.3, V13.3.36
+- GPU: NVIDIA GeForce RTX 4070, 12 GB, sm_89, 46 SMs
+
+Context: cuTile 0.2.0 generated launchers hard-code `block_dim=(1,1,1)`, which made the
+first Q8_0 8B-shape signal land around 7-8 GB/s. The Q8_0 checkpoint below is the
+new multi-row CUDA decode-GEMV backend in `src/kernels.rs` (`q8_0_gemv_r4t64`), measured
+with synthetic GGUF-native Q8_0 rows at Qwen3-8B matrix shapes. Bytes are
+`quantized_weight_bytes + fp16_activation_bytes + fp16_output_bytes`.
+
+| dtype | rows | k | avg ms | achieved GB/s |
+|---|---:|---:|---:|---:|
+| Q8_0 | 4096 | 4096 | 0.046 | 391.9 |
+| Q8_0 | 1024 | 4096 | 0.014 | 328.2 |
+| Q8_0 | 12288 | 4096 | 0.136 | 392.8 |
+| Q8_0 | 4096 | 12288 | 0.149 | 359.6 |
+| Q8_0 | 151936 | 4096 | 1.632 | 405.4 |
+
+Correctness gate added for this backend:
+
+```bash
+cargo test raw_gemv_q8_0_f16_matches_cpu --test kernels -- --ignored --nocapture
+```

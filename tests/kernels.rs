@@ -12,7 +12,7 @@ use grout::dequant::{GgmlType, dequantize_to_f16, dequantize_to_f32};
 use grout::kernels::{
     add_2d_f16, dequant_q4k_to_f16, dequant_q5k_to_f16, dequant_q6k_to_f16, dequant_q8_0_to_f16,
     embed_gather_q4k_f16, embed_gather_q5k_f16, embed_gather_q6k_f16, embed_gather_q8_0_f16,
-    gemv_q4k_f16, gemv_q5k_f16, gemv_q6k_f16, gemv_q8_0_f16,
+    gemv_q4k_f16, gemv_q5k_f16, gemv_q6k_f16, gemv_q8_0_f16, raw_q8_0_gemv_launch_stream,
 };
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::sync::Arc;
@@ -77,6 +77,25 @@ fn gemv_q8_0_f16_matches_cpu() -> Result<()> {
     for (rows, k, checked_rows) in quant_gemv_shapes() {
         run_q8_0_case(&stream, rows, k, checked_rows)?;
     }
+    Ok(())
+}
+
+#[test]
+#[ignore = "GPU raw quantized GEMV integration: run with `cargo test raw_gemv_q8_0_f16_matches_cpu -- --ignored` and a visible CUDA device"]
+fn raw_gemv_q8_0_f16_matches_cpu() -> Result<()> {
+    if !cuda_available()? {
+        return Ok(());
+    }
+
+    let device = Device::new(0)?;
+    let stream = device.new_stream()?;
+    run_raw_q8_0_case(&stream, 16, 4096, None)?;
+    run_raw_q8_0_case(
+        &stream,
+        151_936,
+        4096,
+        Some(vec![0usize, 1, 777, 75_968, 151_935]),
+    )?;
     Ok(())
 }
 
@@ -318,6 +337,42 @@ fn run_q8_0_case(
         .generics(vec![k.to_string()])
         .sync_on(stream)?;
     let out = result.0.unpartition();
+    let actual = out.to_host_vec().sync_on(stream)?;
+
+    for (row, expected) in expected {
+        let actual = actual[row].to_f32();
+        assert_close(row, actual, expected)?;
+    }
+    Ok(())
+}
+
+fn run_raw_q8_0_case(
+    stream: &Arc<cuda_core::Stream>,
+    rows: usize,
+    k: usize,
+    checked_rows: Option<Vec<usize>>,
+) -> Result<()> {
+    let dtype = GgmlType::Q8_0;
+    let raw = make_quantized_matrix::<BlockQ8_0>(dtype, rows, k, checked_rows.as_deref())?;
+    let x = make_activation(k);
+    let expected = expected_rows(dtype, &raw, rows, k, &x, checked_rows.as_deref())?;
+
+    let weights_host = Arc::new(raw);
+    let x_host = Arc::new(x);
+    let weights = api::copy_host_vec_to_device(&weights_host)
+        .reshape(&[weights_host.len()])
+        .sync_on(stream)?;
+    let x_dev = api::copy_host_vec_to_device(&x_host)
+        .reshape(&[k])
+        .sync_on(stream)?;
+    let mut out = api::zeros::<f16>(&[rows]).sync_on(stream)?;
+
+    raw_q8_0_gemv_launch_stream(stream, &weights, &x_dev, &mut out, rows, k)?;
+    unsafe {
+        stream
+            .synchronize()
+            .map_err(|e| anyhow::anyhow!("raw q8_0 synchronize failed: {e:?}"))?;
+    }
     let actual = out.to_host_vec().sync_on(stream)?;
 
     for (row, expected) in expected {

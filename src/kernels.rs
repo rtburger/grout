@@ -5198,3 +5198,186 @@ pub use kernels::{
     rope_f16, rope_seq_dynpos_f16, rope_seq_f16, silu_mul_2d_f16, silu_mul_vec_f16,
     splitk_reduce_merge,
 };
+
+use anyhow::{Context, Result, ensure};
+use cuda_core::{Function, Module, launch_kernel, sys as cu_sys};
+use cutile::core::f16;
+use cutile::tensor::Tensor;
+use std::ffi::c_void;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Arc, Mutex, OnceLock};
+
+struct RawQuantGemvModule {
+    _module: Arc<Module>,
+    q8_0: Function,
+}
+
+static RAW_QUANT_GEMV_MODULE: OnceLock<Mutex<Option<Arc<RawQuantGemvModule>>>> = OnceLock::new();
+
+fn raw_quant_gemv_module(device: &Arc<cuda_core::Device>) -> Result<Arc<RawQuantGemvModule>> {
+    let cache = RAW_QUANT_GEMV_MODULE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("raw quant GEMV module cache poisoned"))?;
+    if let Some(module) = guard.as_ref() {
+        return Ok(module.clone());
+    }
+
+    let cubin = compile_raw_quant_gemv_cubin()?;
+    let module = device
+        .load_module_from_file(cubin.to_string_lossy().as_ref())
+        .map_err(|e| anyhow::anyhow!("failed to load raw quant GEMV module: {e:?}"))?;
+    let q8_0 = module
+        .load_function("q8_0_gemv_r4t64")
+        .map_err(|e| anyhow::anyhow!("failed to load q8_0_gemv_r4t64: {e:?}"))?;
+    let loaded = Arc::new(RawQuantGemvModule {
+        _module: module,
+        q8_0,
+    });
+    *guard = Some(loaded.clone());
+    Ok(loaded)
+}
+
+fn compile_raw_quant_gemv_cubin() -> Result<PathBuf> {
+    let toolkit = std::env::var("CUDA_TOOLKIT_PATH").unwrap_or_else(|_| "/opt/cuda".to_string());
+    let nvcc = Path::new(&toolkit).join("bin/nvcc");
+    ensure!(nvcc.exists(), "nvcc not found at {}", nvcc.display());
+
+    let arch = std::env::var("GROUT_CUDA_ARCH").unwrap_or_else(|_| "sm_89".to_string());
+    let out_dir = std::env::temp_dir().join("grout_raw_quant_gemv");
+    std::fs::create_dir_all(&out_dir)
+        .with_context(|| format!("failed to create {}", out_dir.display()))?;
+    let cu_path = out_dir.join("raw_quant_gemv.cu");
+    let cubin_path = out_dir.join(format!("raw_quant_gemv_{arch}.cubin"));
+    std::fs::write(&cu_path, RAW_QUANT_GEMV_CUDA_SRC)
+        .with_context(|| format!("failed to write {}", cu_path.display()))?;
+
+    let output = Command::new(&nvcc)
+        .arg("-std=c++17")
+        .arg("-O3")
+        .arg("--cubin")
+        .arg(format!("-arch={arch}"))
+        .arg("-o")
+        .arg(&cubin_path)
+        .arg(&cu_path)
+        .output()
+        .with_context(|| format!("failed to run {}", nvcc.display()))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "nvcc failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    Ok(cubin_path)
+}
+
+pub fn raw_q8_0_gemv_launch_stream(
+    stream: &Arc<cuda_core::Stream>,
+    weights: &Tensor<u8>,
+    x: &Tensor<f16>,
+    out: &mut Tensor<f16>,
+    rows: usize,
+    k: usize,
+) -> Result<()> {
+    let w = weights.device_pointer().cu_deviceptr();
+    let x = x.device_pointer().cu_deviceptr();
+    let y = out.device_pointer().cu_deviceptr();
+    raw_q8_0_gemv_launch_ptr(stream, w, x, y, rows, k)
+}
+
+pub fn raw_q8_0_gemv_launch_ptr(
+    stream: &Arc<cuda_core::Stream>,
+    weights: cu_sys::CUdeviceptr,
+    x: cu_sys::CUdeviceptr,
+    out: cu_sys::CUdeviceptr,
+    rows: usize,
+    k: usize,
+) -> Result<()> {
+    ensure!(k % 32 == 0, "Q8_0 GEMV K must be divisible by 32, got {k}");
+    ensure!(rows <= i32::MAX as usize, "Q8_0 GEMV rows too large");
+    ensure!(k <= i32::MAX as usize, "Q8_0 GEMV K too large");
+    let module = raw_quant_gemv_module(stream.device())?;
+    let row_stride_bytes = ((k / 32) * 34) as i32;
+    let mut w_arg = weights;
+    let mut x_arg = x;
+    let mut y_arg = out;
+    let mut rows_arg = rows as i32;
+    let mut k_arg = k as i32;
+    let mut stride_arg = row_stride_bytes;
+    let mut params: [*mut c_void; 6] = [
+        &mut w_arg as *mut _ as *mut c_void,
+        &mut x_arg as *mut _ as *mut c_void,
+        &mut y_arg as *mut _ as *mut c_void,
+        &mut rows_arg as *mut _ as *mut c_void,
+        &mut k_arg as *mut _ as *mut c_void,
+        &mut stride_arg as *mut _ as *mut c_void,
+    ];
+    unsafe {
+        launch_kernel(
+            module.q8_0.cu_function(),
+            (((rows + 3) / 4) as u32, 1, 1),
+            (256, 1, 1),
+            256 * std::mem::size_of::<f32>() as u32,
+            stream.cu_stream(),
+            &mut params,
+        )
+        .map_err(|e| anyhow::anyhow!("raw Q8_0 GEMV launch failed: {e:?}"))?;
+    }
+    Ok(())
+}
+
+const RAW_QUANT_GEMV_CUDA_SRC: &str = r#"
+#include <cuda_fp16.h>
+#include <stdint.h>
+
+__device__ __forceinline__ float load_half_le(const unsigned char* p) {
+    unsigned short bits = (unsigned short)p[0] | ((unsigned short)p[1] << 8);
+    return __half2float(__ushort_as_half(bits));
+}
+
+__device__ __forceinline__ float deq_q8_0(const unsigned char* row, int col) {
+    const int block = col >> 5;
+    const int n = col & 31;
+    const unsigned char* b = row + block * 34;
+    const signed char* qs = (const signed char*)(b + 2);
+    return load_half_le(b) * (float)qs[n];
+}
+
+extern "C" __global__ void q8_0_gemv_r4t64(
+    const unsigned char* __restrict__ w,
+    const __half* __restrict__ x,
+    __half* __restrict__ y,
+    int rows,
+    int k,
+    int row_stride_bytes
+) {
+    constexpr int ROWS_PER_BLOCK = 4;
+    constexpr int THREADS_PER_ROW = 64;
+    const int lane = threadIdx.x % THREADS_PER_ROW;
+    const int subrow = threadIdx.x / THREADS_PER_ROW;
+    const int row = blockIdx.x * ROWS_PER_BLOCK + subrow;
+    extern __shared__ float smem[];
+    float* row_smem = smem + subrow * THREADS_PER_ROW;
+    float acc = 0.0f;
+    if (row < rows) {
+        const unsigned char* rowp = w + (size_t)row * (size_t)row_stride_bytes;
+        for (int col = lane; col < k; col += THREADS_PER_ROW) {
+            acc += deq_q8_0(rowp, col) * __half2float(x[col]);
+        }
+    }
+    row_smem[lane] = acc;
+    __syncthreads();
+    for (int stride = THREADS_PER_ROW >> 1; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            row_smem[lane] += row_smem[lane + stride];
+        }
+        __syncthreads();
+    }
+    if (lane == 0 && row < rows) {
+        y[row] = __float2half_rn(row_smem[0]);
+    }
+}
+"#;
