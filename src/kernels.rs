@@ -90,6 +90,359 @@ pub mod kernels {
         z.store(tile_z);
     }
 
+    // GGUF quantized GEMV dequant math ported from Candle's CPU quantization
+    // reference (/home/rtb/code/agent/candle/candle-core/src/quantized/k_quants.rs)
+    // and llama.cpp ggml-quants.c. Kernels consume GGUF-native row-contiguous
+    // block layout; no load-time repacking or transposition is assumed.
+    fn extract_u8_1d(tile: Tile<u8, { [1] }>) -> Tile<u8, { [] }> {
+        tile.reshape(const_shape![])
+    }
+
+    fn load_u8(weights: &Tensor<u8, { [-1] }>, byte_offset: i32) -> Tile<u8, { [] }> {
+        extract_u8_1d(weights.load_tile(const_shape![1], [byte_offset]))
+    }
+
+    fn load_f16_le(weights: &Tensor<u8, { [-1] }>, byte_offset: i32) -> Tile<f32, { [] }> {
+        let bytes: Tile<u8, { [2] }> = weights.load_tile(const_shape![2], [byte_offset / 2i32]);
+        let half: Tile<f16, { [1] }> = unpack(bytes);
+        convert_tile(half.reshape(const_shape![]))
+    }
+
+    fn u8_and(value: Tile<u8, { [] }>, mask: u8) -> Tile<u8, { [] }> {
+        andi(value, scalar_to_tile(mask))
+    }
+
+    fn u8_mask_to_f32(value: Tile<u8, { [] }>, mask: u8) -> Tile<f32, { [] }> {
+        convert_tile(u8_and(value, mask))
+    }
+
+    fn u8_shr_mask_to_f32(value: Tile<u8, { [] }>, shift: u8, mask: u8) -> Tile<f32, { [] }> {
+        let shifted = shri(value, scalar_to_tile(shift));
+        convert_tile(u8_and(shifted, mask))
+    }
+
+    fn u8_to_i8_f32(value: Tile<u8, { [] }>) -> Tile<f32, { [] }> {
+        let value: Tile<i8, { [] }> = bitcast(value);
+        convert_tile(value)
+    }
+
+    fn load_scale_min_k4_first(
+        weights: &Tensor<u8, { [-1] }>,
+        scales_base: i32,
+        j: i32,
+    ) -> (Tile<f32, { [] }>, Tile<f32, { [] }>) {
+        let d = u8_mask_to_f32(load_u8(weights, scales_base + j), 63u8);
+        let m = u8_mask_to_f32(load_u8(weights, scales_base + j + 4i32), 63u8);
+        (d, m)
+    }
+
+    fn load_scale_min_k4_second(
+        weights: &Tensor<u8, { [-1] }>,
+        scales_base: i32,
+        j: i32,
+    ) -> (Tile<f32, { [] }>, Tile<f32, { [] }>) {
+        let sixteen: Tile<f32, { [] }> = scalar_to_tile(16.0f32);
+        let d_low = u8_mask_to_f32(load_u8(weights, scales_base + j + 4i32), 0x0fu8);
+        let d_high = u8_shr_mask_to_f32(load_u8(weights, scales_base + j - 4i32), 6u8, 0x03u8);
+        let m_low = u8_shr_mask_to_f32(load_u8(weights, scales_base + j + 4i32), 4u8, 0x0fu8);
+        let m_high = u8_shr_mask_to_f32(load_u8(weights, scales_base + j), 6u8, 0x03u8);
+        (d_low + d_high * sixteen, m_low + m_high * sixteen)
+    }
+
+    fn extract_f16_1d<const B: i32>(block: Tile<f16, { [B] }>, idx: i32) -> Tile<f16, { [] }> {
+        let idx: Tile<i32, { [] }> = scalar_to_tile(idx);
+        let value: Tile<f16, { [1] }> = extract(block, [idx]);
+        value.reshape(const_shape![])
+    }
+
+    #[cutile::entry(print_ir=false,
+                       unchecked_accesses=true,
+                       optimization_hints = (
+                         sm_120 = (occupancy=1, max_divisibility=16,),
+                       ))]
+    unsafe fn gemv_q8_0_f16<const K: i32>(
+        out: &mut Tensor<f16, { [1] }>,
+        weights: &Tensor<u8, { [-1] }>,
+        x: &Tensor<f16, { [-1] }>,
+    ) {
+        let row = get_tile_block_id().0;
+        let x_part: Partition<f16, { [32] }> = x.partition(const_shape![32]);
+        let row_stride_bytes = (K / 32) * 34;
+        let row_base = row * row_stride_bytes;
+        let mut acc: Tile<f32, { [] }> = scalar_to_tile(0.0f32);
+
+        for block_idx in 0i32..(K / 32) {
+            let block_base = row_base + block_idx * 34;
+            let d = load_f16_le(weights, block_base);
+            let x_block: Tile<f16, { [32] }> = x_part.load([block_idx]);
+
+            for j in 0i32..32 {
+                let q_u8 = load_u8(weights, block_base + 2i32 + j);
+                let q_i8: Tile<i8, { [] }> = bitcast(q_u8);
+                let q_f32: Tile<f32, { [] }> = convert_tile(q_i8);
+                let x_f32: Tile<f32, { [] }> = convert_tile(extract_f16_1d(x_block, j));
+                acc = acc + d * q_f32 * x_f32;
+            }
+        }
+
+        let acc: Tile<f16, { [] }> = convert_tile(acc);
+        out.store(acc.reshape(const_shape![1]));
+    }
+
+    #[cutile::entry(print_ir=false,
+                       unchecked_accesses=true,
+                       optimization_hints = (
+                         sm_120 = (occupancy=1, max_divisibility=16,),
+                       ))]
+    unsafe fn gemv_q4k_f16<const K: i32>(
+        out: &mut Tensor<f16, { [1] }>,
+        weights: &Tensor<u8, { [-1] }>,
+        x: &Tensor<f16, { [-1] }>,
+    ) {
+        let row = get_tile_block_id().0;
+        let x_part: Partition<f16, { [256] }> = x.partition(const_shape![256]);
+        let row_stride_bytes = (K / 256) * 144;
+        let row_base = row * row_stride_bytes;
+        let mut acc: Tile<f32, { [] }> = scalar_to_tile(0.0f32);
+
+        for block_idx in 0i32..(K / 256) {
+            let block_base = row_base + block_idx * 144;
+            let d = load_f16_le(weights, block_base);
+            let dmin = load_f16_le(weights, block_base + 2i32);
+            let scales_base = block_base + 4i32;
+            let qs_base = block_base + 16i32;
+            let x_block: Tile<f16, { [256] }> = x_part.load([block_idx]);
+
+            for group in 0i32..2 {
+                let (sc_low, m_low) = load_scale_min_k4_first(weights, scales_base, group * 2i32);
+                let (sc_high, m_high) =
+                    load_scale_min_k4_first(weights, scales_base, group * 2i32 + 1i32);
+                let d_low = d * sc_low;
+                let d_high = d * sc_high;
+                let min_low = dmin * m_low;
+                let min_high = dmin * m_high;
+                for l in 0i32..32 {
+                    let q_byte = load_u8(weights, qs_base + group * 32i32 + l);
+                    let q_low = u8_mask_to_f32(q_byte, 0x0fu8);
+                    let x_low: Tile<f32, { [] }> =
+                        convert_tile(extract_f16_1d(x_block, group * 64i32 + l));
+                    acc = acc + (d_low * q_low - min_low) * x_low;
+
+                    let q_high = u8_shr_mask_to_f32(q_byte, 4u8, 0x0fu8);
+                    let x_high: Tile<f32, { [] }> =
+                        convert_tile(extract_f16_1d(x_block, group * 64i32 + 32i32 + l));
+                    acc = acc + (d_high * q_high - min_high) * x_high;
+                }
+            }
+            for group in 2i32..4 {
+                let (sc_low, m_low) = load_scale_min_k4_second(weights, scales_base, group * 2i32);
+                let (sc_high, m_high) =
+                    load_scale_min_k4_second(weights, scales_base, group * 2i32 + 1i32);
+                let d_low = d * sc_low;
+                let d_high = d * sc_high;
+                let min_low = dmin * m_low;
+                let min_high = dmin * m_high;
+                for l in 0i32..32 {
+                    let q_byte = load_u8(weights, qs_base + group * 32i32 + l);
+                    let q_low = u8_mask_to_f32(q_byte, 0x0fu8);
+                    let x_low: Tile<f32, { [] }> =
+                        convert_tile(extract_f16_1d(x_block, group * 64i32 + l));
+                    acc = acc + (d_low * q_low - min_low) * x_low;
+
+                    let q_high = u8_shr_mask_to_f32(q_byte, 4u8, 0x0fu8);
+                    let x_high: Tile<f32, { [] }> =
+                        convert_tile(extract_f16_1d(x_block, group * 64i32 + 32i32 + l));
+                    acc = acc + (d_high * q_high - min_high) * x_high;
+                }
+            }
+        }
+
+        let acc: Tile<f16, { [] }> = convert_tile(acc);
+        out.store(acc.reshape(const_shape![1]));
+    }
+
+    #[cutile::entry(print_ir=false,
+                       unchecked_accesses=true,
+                       optimization_hints = (
+                         sm_120 = (occupancy=1, max_divisibility=16,),
+                       ))]
+    unsafe fn gemv_q6k_f16<const K: i32>(
+        out: &mut Tensor<f16, { [1] }>,
+        weights: &Tensor<u8, { [-1] }>,
+        x: &Tensor<f16, { [-1] }>,
+    ) {
+        let row = get_tile_block_id().0;
+        let x_part: Partition<f16, { [256] }> = x.partition(const_shape![256]);
+        let row_stride_bytes = (K / 256) * 210;
+        let row_base = row * row_stride_bytes;
+        let q_offset: Tile<f32, { [] }> = scalar_to_tile(32.0f32);
+        let q_high_mul: Tile<f32, { [] }> = scalar_to_tile(16.0f32);
+        let mut acc: Tile<f32, { [] }> = scalar_to_tile(0.0f32);
+
+        for block_idx in 0i32..(K / 256) {
+            let block_base = row_base + block_idx * 210;
+            let ql_base = block_base;
+            let qh_base = block_base + 128i32;
+            let scales_base = block_base + 192i32;
+            let d = load_f16_le(weights, block_base + 208i32);
+            let x_block: Tile<f16, { [256] }> = x_part.load([block_idx]);
+
+            for half in 0i32..2 {
+                let ql_half_base = ql_base + half * 64i32;
+                let qh_half_base = qh_base + half * 32i32;
+                let sc_half_base = scales_base + half * 8i32;
+                let x_half_base = half * 128i32;
+                for l in 0i32..32 {
+                    let ql0 = load_u8(weights, ql_half_base + l);
+                    let ql1 = load_u8(weights, ql_half_base + 32i32 + l);
+                    let qh = load_u8(weights, qh_half_base + l);
+                    let is = l / 16i32;
+
+                    let sc0 = u8_to_i8_f32(load_u8(weights, sc_half_base + is));
+                    let q0 = u8_mask_to_f32(ql0, 0x0fu8) + u8_mask_to_f32(qh, 0x03u8) * q_high_mul
+                        - q_offset;
+                    let x0: Tile<f32, { [] }> =
+                        convert_tile(extract_f16_1d(x_block, x_half_base + l));
+                    acc = acc + d * sc0 * q0 * x0;
+
+                    let sc1 = u8_to_i8_f32(load_u8(weights, sc_half_base + is + 2i32));
+                    let q1 = u8_mask_to_f32(ql1, 0x0fu8)
+                        + u8_shr_mask_to_f32(qh, 2u8, 0x03u8) * q_high_mul
+                        - q_offset;
+                    let x1: Tile<f32, { [] }> =
+                        convert_tile(extract_f16_1d(x_block, x_half_base + 32i32 + l));
+                    acc = acc + d * sc1 * q1 * x1;
+
+                    let sc2 = u8_to_i8_f32(load_u8(weights, sc_half_base + is + 4i32));
+                    let q2 = u8_shr_mask_to_f32(ql0, 4u8, 0x0fu8)
+                        + u8_shr_mask_to_f32(qh, 4u8, 0x03u8) * q_high_mul
+                        - q_offset;
+                    let x2: Tile<f32, { [] }> =
+                        convert_tile(extract_f16_1d(x_block, x_half_base + 64i32 + l));
+                    acc = acc + d * sc2 * q2 * x2;
+
+                    let sc3 = u8_to_i8_f32(load_u8(weights, sc_half_base + is + 6i32));
+                    let q3 = u8_shr_mask_to_f32(ql1, 4u8, 0x0fu8)
+                        + u8_shr_mask_to_f32(qh, 6u8, 0x03u8) * q_high_mul
+                        - q_offset;
+                    let x3: Tile<f32, { [] }> =
+                        convert_tile(extract_f16_1d(x_block, x_half_base + 96i32 + l));
+                    acc = acc + d * sc3 * q3 * x3;
+                }
+            }
+        }
+
+        let acc: Tile<f16, { [] }> = convert_tile(acc);
+        out.store(acc.reshape(const_shape![1]));
+    }
+
+    #[cutile::entry(print_ir=false,
+                       unchecked_accesses=true,
+                       optimization_hints = (
+                         sm_120 = (occupancy=1, max_divisibility=16,),
+                       ))]
+    unsafe fn gemv_q5k_f16<const K: i32>(
+        out: &mut Tensor<f16, { [1] }>,
+        weights: &Tensor<u8, { [-1] }>,
+        x: &Tensor<f16, { [-1] }>,
+    ) {
+        let row = get_tile_block_id().0;
+        let x_part: Partition<f16, { [256] }> = x.partition(const_shape![256]);
+        let row_stride_bytes = (K / 256) * 176;
+        let row_base = row * row_stride_bytes;
+        let q_high_add: Tile<f32, { [] }> = scalar_to_tile(16.0f32);
+        let mut acc: Tile<f32, { [] }> = scalar_to_tile(0.0f32);
+
+        for block_idx in 0i32..(K / 256) {
+            let block_base = row_base + block_idx * 176;
+            let d = load_f16_le(weights, block_base);
+            let dmin = load_f16_le(weights, block_base + 2i32);
+            let scales_base = block_base + 4i32;
+            let qh_base = block_base + 16i32;
+            let ql_base = block_base + 48i32;
+            let x_block: Tile<f16, { [256] }> = x_part.load([block_idx]);
+
+            let (sc0, m0) = load_scale_min_k4_first(weights, scales_base, 0i32);
+            let (sc1, m1) = load_scale_min_k4_first(weights, scales_base, 1i32);
+            let d0 = d * sc0;
+            let d1 = d * sc1;
+            let min0 = dmin * m0;
+            let min1 = dmin * m1;
+            for l in 0i32..32 {
+                let qh = load_u8(weights, qh_base + l);
+                let ql = load_u8(weights, ql_base + l);
+                let q0 =
+                    u8_mask_to_f32(ql, 0x0fu8) + u8_shr_mask_to_f32(qh, 0u8, 0x01u8) * q_high_add;
+                let x0: Tile<f32, { [] }> = convert_tile(extract_f16_1d(x_block, l));
+                acc = acc + (d0 * q0 - min0) * x0;
+                let q1 = u8_shr_mask_to_f32(ql, 4u8, 0x0fu8)
+                    + u8_shr_mask_to_f32(qh, 1u8, 0x01u8) * q_high_add;
+                let x1: Tile<f32, { [] }> = convert_tile(extract_f16_1d(x_block, 32i32 + l));
+                acc = acc + (d1 * q1 - min1) * x1;
+            }
+
+            let (sc2, m2) = load_scale_min_k4_first(weights, scales_base, 2i32);
+            let (sc3, m3) = load_scale_min_k4_first(weights, scales_base, 3i32);
+            let d2 = d * sc2;
+            let d3 = d * sc3;
+            let min2 = dmin * m2;
+            let min3 = dmin * m3;
+            for l in 0i32..32 {
+                let qh = load_u8(weights, qh_base + l);
+                let ql = load_u8(weights, ql_base + 32i32 + l);
+                let q2 =
+                    u8_mask_to_f32(ql, 0x0fu8) + u8_shr_mask_to_f32(qh, 2u8, 0x01u8) * q_high_add;
+                let x2: Tile<f32, { [] }> = convert_tile(extract_f16_1d(x_block, 64i32 + l));
+                acc = acc + (d2 * q2 - min2) * x2;
+                let q3 = u8_shr_mask_to_f32(ql, 4u8, 0x0fu8)
+                    + u8_shr_mask_to_f32(qh, 3u8, 0x01u8) * q_high_add;
+                let x3: Tile<f32, { [] }> = convert_tile(extract_f16_1d(x_block, 96i32 + l));
+                acc = acc + (d3 * q3 - min3) * x3;
+            }
+
+            let (sc4, m4) = load_scale_min_k4_second(weights, scales_base, 4i32);
+            let (sc5, m5) = load_scale_min_k4_second(weights, scales_base, 5i32);
+            let d4 = d * sc4;
+            let d5 = d * sc5;
+            let min4 = dmin * m4;
+            let min5 = dmin * m5;
+            for l in 0i32..32 {
+                let qh = load_u8(weights, qh_base + l);
+                let ql = load_u8(weights, ql_base + 64i32 + l);
+                let q4 =
+                    u8_mask_to_f32(ql, 0x0fu8) + u8_shr_mask_to_f32(qh, 4u8, 0x01u8) * q_high_add;
+                let x4: Tile<f32, { [] }> = convert_tile(extract_f16_1d(x_block, 128i32 + l));
+                acc = acc + (d4 * q4 - min4) * x4;
+                let q5 = u8_shr_mask_to_f32(ql, 4u8, 0x0fu8)
+                    + u8_shr_mask_to_f32(qh, 5u8, 0x01u8) * q_high_add;
+                let x5: Tile<f32, { [] }> = convert_tile(extract_f16_1d(x_block, 160i32 + l));
+                acc = acc + (d5 * q5 - min5) * x5;
+            }
+
+            let (sc6, m6) = load_scale_min_k4_second(weights, scales_base, 6i32);
+            let (sc7, m7) = load_scale_min_k4_second(weights, scales_base, 7i32);
+            let d6 = d * sc6;
+            let d7 = d * sc7;
+            let min6 = dmin * m6;
+            let min7 = dmin * m7;
+            for l in 0i32..32 {
+                let qh = load_u8(weights, qh_base + l);
+                let ql = load_u8(weights, ql_base + 96i32 + l);
+                let q6 =
+                    u8_mask_to_f32(ql, 0x0fu8) + u8_shr_mask_to_f32(qh, 6u8, 0x01u8) * q_high_add;
+                let x6: Tile<f32, { [] }> = convert_tile(extract_f16_1d(x_block, 192i32 + l));
+                acc = acc + (d6 * q6 - min6) * x6;
+                let q7 = u8_shr_mask_to_f32(ql, 4u8, 0x0fu8)
+                    + u8_shr_mask_to_f32(qh, 7u8, 0x01u8) * q_high_add;
+                let x7: Tile<f32, { [] }> = convert_tile(extract_f16_1d(x_block, 224i32 + l));
+                acc = acc + (d7 * q7 - min7) * x7;
+            }
+        }
+
+        let acc: Tile<f16, { [] }> = convert_tile(acc);
+        out.store(acc.reshape(const_shape![1]));
+    }
+
     unsafe fn load_f16_ptr(
         ptrs: &Tensor<i64, { [-1] }>,
         group_id: i32,
@@ -4024,9 +4377,9 @@ pub use kernels::{
     argmax_reduce_blocks_to_u32, embedding_batch_f16, embedding_f16, flash_attn_causal_f16,
     flash_attn_causal_seq_dynpos_f16, flash_attn_causal_seq_f16, flash_attn_f16, fmha_causal,
     fmha_decode_gqa_split, fmha_prefill_causal, fmha_prefill_gqa, fmha_prefill_gqa_lpt,
-    fmha_prefill_gqa_lpt_split, gather_row_f16, gemm_f16, group_gemm_f16_nt_desc,
-    kv_cache_update_f16, kv_cache_update_seq_dynpos_f16, kv_cache_update_seq_f16,
-    lm_head_argmax_blocks_f16, prefill_splitk_reduce_merge, qk_norm_f16,
+    fmha_prefill_gqa_lpt_split, gather_row_f16, gemm_f16, gemv_q4k_f16, gemv_q5k_f16, gemv_q6k_f16,
+    gemv_q8_0_f16, group_gemm_f16_nt_desc, kv_cache_update_f16, kv_cache_update_seq_dynpos_f16,
+    kv_cache_update_seq_f16, lm_head_argmax_blocks_f16, prefill_splitk_reduce_merge, qk_norm_f16,
     qk_norm_rope_kv_decode_raw_f16, qk_norm_rope_kv_prefill_raw_f16, qk_rope_dynpos_f16,
     rms_norm_f16, rms_norm_persistent_f16, rope_f16, rope_seq_dynpos_f16, rope_seq_f16,
     silu_mul_2d_f16, silu_mul_vec_f16, splitk_reduce_merge,
