@@ -135,6 +135,92 @@ impl WeightLoader {
         let tensor = self.load_device_f16(name, stream)?;
         Ok(MatrixWeight::single(Weight::f16(tensor)?))
     }
+
+    /// Estimated resident device bytes for model weights after Grout's loader
+    /// policy is applied. Safetensors weights are resident as fp16; GGUF
+    /// quantized matrix tensors stay in their native block format while scalar
+    /// and norm tensors are resident as fp16.
+    pub fn resident_weight_bytes(&self) -> Result<usize> {
+        if let Some(gguf) = &self.gguf {
+            return resident_weight_bytes_gguf(gguf);
+        }
+        resident_weight_bytes_safetensors(&self.weight_map, &self.shards)
+    }
+
+    /// Pooled quantized-prefill dequant scratch bytes. This intentionally
+    /// excludes token embeddings and LM head/output tensors.
+    pub fn prefill_dequant_scratch_bytes(&self) -> Result<usize> {
+        if let Some(gguf) = &self.gguf {
+            return match crate::quant_scratch::prefill_dequant_scratch_plan(&gguf.content) {
+                Ok(plan) => Ok(plan.bytes),
+                Err(_) => Ok(0),
+            };
+        }
+        Ok(0)
+    }
+}
+
+fn resident_weight_bytes_gguf(gguf: &GgufFile) -> Result<usize> {
+    let mut total = 0usize;
+    for info in gguf.content.tensor_infos.values() {
+        ensure!(
+            info.dtype.is_supported_for_phase1(),
+            "unsupported ggml type {} for tensor `{}`",
+            info.dtype,
+            info.name
+        );
+        let bytes = match info.dtype {
+            GgmlType::F16 | GgmlType::F32 => info
+                .elem_count()?
+                .checked_mul(std::mem::size_of::<f16>())
+                .with_context(|| format!("resident byte size overflows for `{}`", info.name))?,
+            GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K => {
+                info.size_in_bytes()?
+            }
+            other => bail!("unsupported ggml type {other} for tensor `{}`", info.name),
+        };
+        total = total
+            .checked_add(bytes)
+            .context("GGUF resident weight byte total overflows usize")?;
+    }
+    Ok(total)
+}
+
+fn resident_weight_bytes_safetensors(
+    weight_map: &HashMap<String, String>,
+    shards: &HashMap<String, memmap2::Mmap>,
+) -> Result<usize> {
+    let mut total = 0usize;
+    for (name, shard_name) in weight_map {
+        let mmap = shards
+            .get(shard_name)
+            .with_context(|| format!("missing mmap for shard `{shard_name}`"))?;
+        let st = SafeTensors::deserialize(&mmap[..])
+            .with_context(|| format!("failed to deserialize `{shard_name}`"))?;
+        let view = st
+            .tensor(name)
+            .with_context(|| format!("tensor `{name}` not found in `{shard_name}`"))?;
+        ensure!(
+            safetensor_dtype_supported_for_f16(view.dtype()),
+            "unsupported dtype for fp16 resident weight estimate: {:?} in `{name}`",
+            view.dtype()
+        );
+        let elems = view.shape().iter().try_fold(1usize, |acc, dim| {
+            acc.checked_mul(*dim)
+                .with_context(|| format!("tensor `{name}` element count overflows usize"))
+        })?;
+        let bytes = elems
+            .checked_mul(std::mem::size_of::<f16>())
+            .with_context(|| format!("tensor `{name}` resident byte size overflows usize"))?;
+        total = total
+            .checked_add(bytes)
+            .context("safetensors resident weight byte total overflows usize")?;
+    }
+    Ok(total)
+}
+
+fn safetensor_dtype_supported_for_f16(dtype: Dtype) -> bool {
+    matches!(dtype, Dtype::F16 | Dtype::BF16 | Dtype::F32 | Dtype::F64)
 }
 
 fn is_gguf_path(path: &Path) -> bool {

@@ -45,7 +45,7 @@ The first run compiles all cuTile kernels (MLIR -> PTX -> CUBIN). Subsequent run
 | `--model <PATH>` | (required) | Path to model directory |
 | `--prompt <TEXT>` | (required) | Input prompt |
 | `--max-new-tokens <N>` | `128` | Maximum tokens to generate |
-| `--max-seq-len <N>` | model default | Override max sequence length |
+| `--max-ctx <N>` (`--max-seq-len`) | 32k for 4B/smaller, 16k for 8B-class | Override max context length |
 | `--sample` | `false` | Enable sampling (temperature/top-k) |
 | `--raw-prompt` | `false` | Skip chat template wrapping |
 | `--device-argmax` | `false` | Run greedy argmax on the GPU |

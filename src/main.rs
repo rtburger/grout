@@ -15,8 +15,8 @@ struct Args {
     #[arg(long, default_value_t = 128)]
     max_new_tokens: usize,
 
-    #[arg(long)]
-    max_seq_len: Option<usize>,
+    #[arg(long = "max-ctx", visible_alias = "max-seq-len")]
+    max_ctx: Option<usize>,
 
     #[arg(long, default_value_t = false)]
     sample: bool,
@@ -42,7 +42,7 @@ struct Args {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let mut engine = Qwen3Engine::load(&args.model, args.max_seq_len).await?;
+    let mut engine = Qwen3Engine::load(&args.model, args.max_ctx).await?;
     engine.set_sampling_enabled(args.sample);
     engine.set_chat_template_enabled(!args.raw_prompt);
     engine.set_device_argmax_enabled(args.device_argmax);

@@ -174,6 +174,11 @@ const QK_ROPE_CGA_DEFAULT: bool = false;
 //   CHUNK_D=8   → 128 CTAs: 791.7
 // Override with GROUT_KV_CACHE_DYN_CHUNK_D. Must divide head_dim.
 const KV_CACHE_DYN_CHUNK_D_DEFAULT: usize = 32;
+const DEFAULT_MAX_CTX_SMALL: usize = 32 * 1024;
+const DEFAULT_MAX_CTX_8B_CLASS: usize = 16 * 1024;
+const EIGHT_B_CLASS_HIDDEN_SIZE: usize = 4096;
+const KV_BYTES_PER_TOKEN_PREFLIGHT: usize = 144 * 1024;
+const VRAM_PREFLIGHT_SLACK_BYTES: usize = 700 * 1024 * 1024;
 
 // ── Attention tile constants — PREFILL path ────────────────────────
 // Static defaults tuned for short-pp (pp=18) from 2026-04-20 sweep.
@@ -292,6 +297,72 @@ fn floor_power_of_two_le(n: usize) -> usize {
         p *= 2;
     }
     p
+}
+
+fn default_max_ctx_for_config(cfg: &Qwen3Config) -> usize {
+    if cfg.hidden_size >= EIGHT_B_CLASS_HIDDEN_SIZE {
+        DEFAULT_MAX_CTX_8B_CLASS
+    } else {
+        DEFAULT_MAX_CTX_SMALL
+    }
+}
+
+fn vram_info_ctx(ctx: &ExecutionContext) -> Result<(usize, usize)> {
+    ctx.device()
+        .bind_to_thread()
+        .map_err(|e| anyhow::anyhow!("failed to bind CUDA context for VRAM preflight: {e:?}"))?;
+    let mut free = 0usize;
+    let mut total = 0usize;
+    unsafe { cu_sys::cuMemGetInfo_v2(&mut free as *mut _, &mut total as *mut _) }
+        .result()
+        .map_err(|e| anyhow::anyhow!("cuMemGetInfo_v2 failed for VRAM preflight: {e:?}"))?;
+    Ok((free, total))
+}
+
+fn mib(bytes: usize) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
+fn checked_sum_bytes(parts: &[usize]) -> Result<usize> {
+    parts.iter().try_fold(0usize, |acc, part| {
+        acc.checked_add(*part)
+            .context("VRAM preflight byte total overflows usize")
+    })
+}
+
+fn run_vram_preflight(
+    loader: &WeightLoader,
+    max_ctx: usize,
+    free_bytes: usize,
+    total_bytes: usize,
+) -> Result<()> {
+    let weights_bytes = loader.resident_weight_bytes()?;
+    let kv_bytes = max_ctx
+        .checked_mul(KV_BYTES_PER_TOKEN_PREFLIGHT)
+        .context("VRAM preflight KV byte estimate overflows usize")?;
+    let scratch_bytes = loader.prefill_dequant_scratch_bytes()?;
+    let required_bytes = checked_sum_bytes(&[
+        weights_bytes,
+        kv_bytes,
+        scratch_bytes,
+        VRAM_PREFLIGHT_SLACK_BYTES,
+    ])?;
+    let summary = format!(
+        "max_ctx={max_ctx}: weights={:.1} MiB + KV={} tokens * 144 KiB/token = {:.1} MiB + scratch={:.1} MiB + slack={:.1} MiB => required={:.1} MiB; free={:.1} MiB / total={:.1} MiB",
+        mib(weights_bytes),
+        max_ctx,
+        mib(kv_bytes),
+        mib(scratch_bytes),
+        mib(VRAM_PREFLIGHT_SLACK_BYTES),
+        mib(required_bytes),
+        mib(free_bytes),
+        mib(total_bytes),
+    );
+    if required_bytes > free_bytes {
+        bail!("VRAM preflight failed: {summary}");
+    }
+    println!("VRAM preflight PASS: {summary}");
+    Ok(())
 }
 
 fn prefill_lpt_swizzle(q_len: usize, head_dim: usize, head_groups: usize) -> usize {
@@ -1345,7 +1416,15 @@ impl Qwen3Engine {
         // Note: cutile-rs handles non-divisible tile shapes via boundary
         // masking. No divisibility checks needed for tile block sizes.
 
-        let max_seq_len = min(max_seq_len.unwrap_or(4096), cfg.max_position_embeddings);
+        let default_max_ctx = default_max_ctx_for_config(&cfg);
+        let requested_max_ctx = max_seq_len.unwrap_or(default_max_ctx);
+        let max_seq_len = min(requested_max_ctx, cfg.max_position_embeddings);
+        if requested_max_ctx > cfg.max_position_embeddings {
+            eprintln!(
+                "warning: requested max context {} exceeds model context {}; capping to {}",
+                requested_max_ctx, cfg.max_position_embeddings, max_seq_len
+            );
+        }
 
         let tokenizer_path = tokenizer_json_path(model_dir, loader.is_gguf())?;
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
@@ -1383,8 +1462,11 @@ impl Qwen3Engine {
             .map(|v| v != "0")
             .unwrap_or(false);
 
-        // Get a stream for synchronous weight loading.
+        // Get a stream for synchronous weight loading and run the VRAM
+        // preflight before allocating resident weights or KV caches.
         let stream = with_context(|ctx| value(ctx.get_cuda_stream().clone())).await?;
+        let (free_vram, total_vram) = with_context(|ctx| value(vram_info_ctx(ctx))).await??;
+        run_vram_preflight(&loader, max_seq_len, free_vram, total_vram)?;
 
         let embed_tokens = loader
             .load_device_weight("model.embed_tokens.weight", &stream)
