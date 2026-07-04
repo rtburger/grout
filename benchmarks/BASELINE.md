@@ -143,6 +143,50 @@ Phase 1 closeout notes:
 - Conditional token-exact 0.6B GGUF-vs-safetensors test status: skipped for lack of local matching F16/BF16 GGUF plus safetensors files. Quantized GGUF output is not compared token-for-token to fp16/bf16 safetensors.
 - Dependency delta: `Cargo.toml` adds only `candle-core = { path = "../candle/candle-core" }` under `[dev-dependencies]`. `Cargo.lock` records `candle-core` 0.11.0 and its transitive dev-only dependency graph; no release dependency was added for Phase 1.
 
+## Phase 2 Task 1 standalone quantized GEMV microbench
+
+Run mode for this microbench row: desktop/display-attached.
+
+Version block for this row:
+
+- Driver: 595.58.03
+- CUDA toolkit: Arch `cuda` package 13.3.1-1; `/opt/cuda/bin/nvcc` CUDA 13.3, V13.3.73
+- tileiras: `/opt/cuda/bin/tileiras`, CUDA Tile IR assembler 13.3, V13.3.36
+
+Command:
+
+```bash
+target/release/quant_gemv_microbench \
+  --gguf ../hf_models/qwen3_4b_gguf/Qwen3-4B-Q4_K_M.gguf \
+  --gguf ../hf_models/qwen3_8b_gguf/Qwen3-8B-Q4_K_M.gguf \
+  --iters 20 --warmup-iters 5
+```
+
+The harness reads tensor shapes and dtypes from each GGUF tensor table; no model shapes are hardcoded. Bytes for GB/s are `quantized_weight_bytes + fp16_activation_bytes + fp16_output_bytes`. These are standalone benchmark kernels only; the engine still has no quantized resident weights.
+
+| model | tensor kind | tensor | dtype | rows | k | achieved GB/s |
+|---|---|---|---:|---:|---:|---:|
+| Qwen3-4B-Q4_K_M | attn_q | blk.0.attn_q.weight | Q4_K | 4096 | 2560 | 79.354 |
+| Qwen3-4B-Q4_K_M | attn_k | blk.0.attn_k.weight | Q4_K | 1024 | 2560 | 70.964 |
+| Qwen3-4B-Q4_K_M | attn_v | blk.0.attn_v.weight | Q6_K | 1024 | 2560 | 90.978 |
+| Qwen3-4B-Q4_K_M | attn_output | blk.0.attn_output.weight | Q4_K | 2560 | 4096 | 83.067 |
+| Qwen3-4B-Q4_K_M | ffn_gate | blk.0.ffn_gate.weight | Q4_K | 9728 | 2560 | 76.367 |
+| Qwen3-4B-Q4_K_M | ffn_up | blk.0.ffn_up.weight | Q4_K | 9728 | 2560 | 80.378 |
+| Qwen3-4B-Q4_K_M | ffn_down | blk.0.ffn_down.weight | Q6_K | 2560 | 9728 | 111.245 |
+| Qwen3-4B-Q4_K_M | attn_v | blk.4.attn_v.weight | Q4_K | 1024 | 2560 | 71.106 |
+| Qwen3-4B-Q4_K_M | ffn_down | blk.4.ffn_down.weight | Q4_K | 2560 | 9728 | 87.454 |
+| Qwen3-4B-Q4_K_M | lm_head | token_embd.weight | Q6_K | 151936 | 2560 | 82.989 |
+| Qwen3-8B-Q4_K_M | attn_q | blk.0.attn_q.weight | Q4_K | 4096 | 4096 | 93.964 |
+| Qwen3-8B-Q4_K_M | attn_k | blk.0.attn_k.weight | Q4_K | 1024 | 4096 | 86.218 |
+| Qwen3-8B-Q4_K_M | attn_v | blk.0.attn_v.weight | Q6_K | 1024 | 4096 | 108.754 |
+| Qwen3-8B-Q4_K_M | attn_output | blk.0.attn_output.weight | Q4_K | 4096 | 4096 | 91.892 |
+| Qwen3-8B-Q4_K_M | ffn_gate | blk.0.ffn_gate.weight | Q4_K | 12288 | 4096 | 96.329 |
+| Qwen3-8B-Q4_K_M | ffn_up | blk.0.ffn_up.weight | Q4_K | 12288 | 4096 | 91.221 |
+| Qwen3-8B-Q4_K_M | ffn_down | blk.0.ffn_down.weight | Q6_K | 4096 | 12288 | 100.907 |
+| Qwen3-8B-Q4_K_M | attn_v | blk.4.attn_v.weight | Q4_K | 1024 | 4096 | 85.863 |
+| Qwen3-8B-Q4_K_M | ffn_down | blk.4.ffn_down.weight | Q4_K | 4096 | 12288 | 99.288 |
+| Qwen3-8B-Q4_K_M | lm_head | output.weight | Q6_K | 151936 | 4096 | 89.318 |
+
 ## First-run kernel/JIT behavior
 
 - Before re-running with CUDA 13.3, cuTile temp artifacts were cleared from `/tmp`.
