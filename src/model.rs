@@ -30,7 +30,7 @@ use std::cmp::{Reverse, min};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::mem::{MaybeUninit, size_of};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
@@ -1242,6 +1242,7 @@ impl KernelWarmRegistry {
 
 pub struct GenerationOutput {
     pub text: String,
+    pub token_ids: Vec<u32>,
     pub prompt_tokens: usize,
     pub generated_tokens: usize,
     pub prompt_elapsed: Duration,
@@ -1300,11 +1301,38 @@ pub struct Qwen3Engine {
     decode_runner: Option<DecodeCudaGraphRunner>,
 }
 
+fn tokenizer_json_path(model_path: &Path, is_gguf: bool) -> Result<PathBuf> {
+    if !is_gguf {
+        return Ok(model_path.join("tokenizer.json"));
+    }
+    let parent = model_path.parent().unwrap_or_else(|| Path::new("."));
+    let sibling = parent.join("tokenizer.json");
+    if sibling.exists() {
+        return Ok(sibling);
+    }
+    if let Ok(path) = std::env::var("GROUT_TOKENIZER_JSON") {
+        return Ok(PathBuf::from(path));
+    }
+    bail!(
+        "GGUF model `{}` requires tokenizer.json next to the .gguf file or GROUT_TOKENIZER_JSON",
+        model_path.display()
+    )
+}
+
 impl Qwen3Engine {
     pub async fn load(model_dir: &Path, max_seq_len: Option<usize>) -> Result<Self> {
         model_dir.try_exists()?;
-        let cfg = Qwen3Config::from_model_dir(model_dir)?;
-        let generation_cfg = GenerationConfig::from_model_dir(model_dir)?;
+        let loader = WeightLoader::new(model_dir)?;
+        let cfg = if let Some(cfg) = loader.gguf_config() {
+            cfg.clone()
+        } else {
+            Qwen3Config::from_model_dir(model_dir)?
+        };
+        let generation_cfg = if loader.is_gguf() {
+            None
+        } else {
+            GenerationConfig::from_model_dir(model_dir)?
+        };
         ensure!(
             !cfg.use_sliding_window,
             "sliding-window attention is not supported in this engine"
@@ -1315,9 +1343,9 @@ impl Qwen3Engine {
 
         let max_seq_len = min(max_seq_len.unwrap_or(4096), cfg.max_position_embeddings);
 
-        let loader = WeightLoader::new(model_dir)?;
-        let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
-            .map_err(|e| anyhow::anyhow!("failed to load tokenizer.json: {e}"))?;
+        let tokenizer_path = tokenizer_json_path(model_dir, loader.is_gguf())?;
+        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| anyhow::anyhow!("failed to load {}: {e}", tokenizer_path.display()))?;
         let vocab = tokenizer.get_vocab(true);
         let use_chat_template =
             vocab.contains_key("<|im_start|>") && vocab.contains_key("<|im_end|>");
@@ -2061,10 +2089,12 @@ impl Qwen3Engine {
                 .map_err(|e| anyhow::anyhow!("tokenizer decode failed: {e}"))?
         };
 
+        let generated_tokens = generated_ids.len();
         Ok(GenerationOutput {
             text,
+            token_ids: generated_ids,
             prompt_tokens: prompt_ids.len(),
-            generated_tokens: generated_ids.len(),
+            generated_tokens,
             prompt_elapsed,
             decode_elapsed,
             total_elapsed,

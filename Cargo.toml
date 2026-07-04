@@ -29,6 +29,9 @@ cuda-async = "0.2.0"
 cutile-compiler = "0.2.0"
 cutile = "0.2.0"
 
+[dev-dependencies]
+candle-core = { path = "../candle/candle-core" }
+
 [features]
 benchmarks = []
 

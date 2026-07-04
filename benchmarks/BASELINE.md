@@ -96,6 +96,28 @@ Local roofline uses the RTX 4070 memory bandwidth of 504 GB/s.
 - Quantized Grout expectation: Qwen3-8B Q4_K_M plausible band 85-92 tok/s. This is a parity race; demanding materially above llama.cpp's 90.0 tok/s demands near-impossible roofline headroom.
 - The old "2x candle" Phase 2 gate is physically impossible on the 4B: 2 * 117.7 = 235.4 tok/s, above the ~202 tok/s 4B Q4_K_M roofline. The corrected Phase 2 gates are per-model in `AGENTS.md`: 4B hard >=135 tok/s, target >=149.1; 8B hard >=84 tok/s, target >=90.0.
 
+## Phase 1 GGUF fp16-compute gate
+
+Run mode for this GGUF row: desktop/display-attached. Driver/toolkit/tileiras versions are listed in Host/toolchain.
+
+Command:
+
+```bash
+GROUT_TOKENIZER_JSON=../hf_models/qwen3_4b/tokenizer.json \
+target/release/grout_bench \
+  --model /home/rtb/.cache/huggingface/hub/models--unsloth--Qwen3-4B-GGUF/snapshots/22c9fc8a8c7700b76a1789366280a6a5a1ad1120/Qwen3-4B-Q4_K_M.gguf \
+  --prompt 'Write one paragraph about compiler design, continuing until the token limit.' \
+  --max-new-tokens 36 --reps 5 --warmup-reps 2 --ignore-eos --quiet
+```
+
+Result after GGUF Q4_K_M CPU dequantize-to-fp16 and unchanged engine upload:
+
+```text
+  [grout] mean over 5 runs: decode_phase_tps=55.4, request_gen_tps=53.7, e2e_tps=91.0, elapsed=0.671s
+```
+
+This is within +/-3% of the Phase 0 fp16 Qwen3-4B baseline (`55.4 tok/s` decode). The ignored 4B GGUF integration test also passed with the same file and tokenizer. Qwen3-0.6B GGUF files were not present locally; those integration tests are env-gated and skip when files are absent.
+
 ## First-run kernel/JIT behavior
 
 - Before re-running with CUDA 13.3, cuTile temp artifacts were cleared from `/tmp`.

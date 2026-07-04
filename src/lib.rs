@@ -1,6 +1,8 @@
 pub mod config;
 mod cublas;
+pub mod dequant;
 mod flash_decode;
+pub mod gguf;
 pub mod loader;
 
 pub mod kernels;
