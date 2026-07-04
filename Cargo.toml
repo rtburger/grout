@@ -5,6 +5,10 @@ edition = "2024"
 default-run = "grout"
 autobins = false
 
+[lib]
+name = "grout"
+path = "src/lib.rs"
+
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4.5.60", features = ["derive"] }

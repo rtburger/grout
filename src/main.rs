@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use grout::model::Qwen3Engine;
+use grout::Qwen3Engine;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]

@@ -9,6 +9,7 @@ use grout::kernels::add_2d_f16;
 use std::sync::Arc;
 
 #[test]
+#[ignore = "GPU kernel integration: run with `cargo test -- --ignored` and a visible CUDA device"]
 fn add_2d_kernel_compiles_and_executes() -> Result<()> {
     match Device::device_count() {
         Ok(count) if count > 0 => {}
