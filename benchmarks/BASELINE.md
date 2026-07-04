@@ -100,6 +100,8 @@ Local roofline uses the RTX 4070 memory bandwidth of 504 GB/s.
 
 Run mode for this GGUF row: desktop/display-attached. Driver/toolkit/tileiras versions are listed in Host/toolchain.
 
+TODO: rerun the Qwen3-4B GGUF integration and throughput gate headless after the displays are moved off the 4070 or the desktop session is stopped, then append the headless row here.
+
 Command:
 
 ```bash
