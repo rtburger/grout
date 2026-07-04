@@ -174,9 +174,10 @@ fn resident_weight_bytes_gguf(gguf: &GgufFile) -> Result<usize> {
                 .elem_count()?
                 .checked_mul(std::mem::size_of::<f16>())
                 .with_context(|| format!("resident byte size overflows for `{}`", info.name))?,
-            GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K => {
-                info.size_in_bytes()?
-            }
+            GgmlType::Q8_0 => info.size_in_bytes()?.checked_mul(2).with_context(|| {
+                format!("Q8_0 resident byte size overflows for `{}`", info.name)
+            })?,
+            GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K => info.size_in_bytes()?,
             other => bail!("unsupported ggml type {other} for tensor `{}`", info.name),
         };
         total = total
@@ -312,7 +313,9 @@ fn load_device_weight_gguf(
         info.dtype
     );
     match info.dtype {
-        GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K => {
+        GgmlType::Q8_0 => load_device_q8_0_soa(&gguf_name, info.shape.clone(), data, stream)
+            .map(MatrixWeight::single),
+        GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K => {
             let host_data = Arc::new(data.to_vec());
             let device_tensor = api::copy_host_vec_to_device(&host_data)
                 .sync_on(stream)
@@ -335,6 +338,74 @@ fn load_device_weight_gguf(
         }
         other => bail!("unsupported ggml type {other} for tensor `{gguf_name}`"),
     }
+}
+
+fn load_device_q8_0_soa(
+    gguf_name: &str,
+    shape: Vec<usize>,
+    data: &[u8],
+    stream: &Arc<cuda_core::Stream>,
+) -> Result<Weight> {
+    ensure!(
+        shape.len() == 2,
+        "Q8_0 tensor `{gguf_name}` must be rank-2, got {shape:?}"
+    );
+    let rows = shape[0];
+    let k = shape[1];
+    ensure!(
+        k.is_multiple_of(32),
+        "Q8_0 tensor `{gguf_name}` K must be divisible by 32, got {k}"
+    );
+    let blocks_per_row = k / 32;
+    let expected = rows
+        .checked_mul(blocks_per_row)
+        .and_then(|blocks| blocks.checked_mul(GgmlType::Q8_0.type_size()))
+        .context("Q8_0 byte size overflows usize")?;
+    ensure!(
+        data.len() == expected,
+        "Q8_0 tensor `{gguf_name}` byte length mismatch: got {}, expected {expected}",
+        data.len()
+    );
+
+    let mut qs = Vec::<i8>::with_capacity(rows * k);
+    let mut scales = Vec::<f16>::with_capacity(rows * blocks_per_row);
+    for row in 0..rows {
+        let row_base = row * blocks_per_row * 34;
+        for block in 0..blocks_per_row {
+            let block_base = row_base + block * 34;
+            let d_bits = u16::from_le_bytes([data[block_base], data[block_base + 1]]);
+            scales.push(f16::from_bits(d_bits));
+            for j in 0..32 {
+                qs.push(data[block_base + 2 + j] as i8);
+            }
+        }
+    }
+
+    let native_host = Arc::new(data.to_vec());
+    let qs_host = Arc::new(qs);
+    let scales_host = Arc::new(scales);
+    let native_dev = api::copy_host_vec_to_device(&native_host)
+        .sync_on(stream)
+        .map_err(|e| anyhow::anyhow!("copy Q8_0 native `{gguf_name}` to device failed: {e:?}"))?
+        .reshape(&[data.len()])
+        .map_err(|e| anyhow::anyhow!("reshape Q8_0 native `{gguf_name}` failed: {e:?}"))?;
+    let qs_dev = api::copy_host_vec_to_device(&qs_host)
+        .sync_on(stream)
+        .map_err(|e| anyhow::anyhow!("copy Q8_0 qs `{gguf_name}` to device failed: {e:?}"))?
+        .reshape(&[rows, k])
+        .map_err(|e| anyhow::anyhow!("reshape Q8_0 qs `{gguf_name}` failed: {e:?}"))?;
+    let scales_dev = api::copy_host_vec_to_device(&scales_host)
+        .sync_on(stream)
+        .map_err(|e| anyhow::anyhow!("copy Q8_0 scales `{gguf_name}` to device failed: {e:?}"))?
+        .reshape(&[rows, blocks_per_row])
+        .map_err(|e| anyhow::anyhow!("reshape Q8_0 scales `{gguf_name}` failed: {e:?}"))?;
+
+    Weight::q8_0_soa(
+        Arc::new(native_dev),
+        Arc::new(qs_dev),
+        Arc::new(scales_dev),
+        shape,
+    )
 }
 
 fn load_host_f16_gguf(gguf: &GgufFile, engine_name: &str) -> Result<HostTensor> {

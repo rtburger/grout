@@ -29,17 +29,18 @@ pub enum KernelKind {
     QkNormRopeKvPrefill,
     QkNormRopeKvDecode,
     ArgmaxReduceBlocks,
+    QuantGemv,
 }
 
 impl KernelKind {
-    pub const COUNT: usize = 17;
+    pub const COUNT: usize = 18;
 
     pub const fn idx(self) -> usize {
         self as usize
     }
 }
 
-pub const TILE_KERNEL_KINDS: [KernelKind; 17] = [
+pub const TILE_KERNEL_KINDS: [KernelKind; 18] = [
     KernelKind::EmbeddingBatch,
     KernelKind::Gemm,
     KernelKind::Gemv,
@@ -57,6 +58,7 @@ pub const TILE_KERNEL_KINDS: [KernelKind; 17] = [
     KernelKind::QkNormRopeKvPrefill,
     KernelKind::QkNormRopeKvDecode,
     KernelKind::ArgmaxReduceBlocks,
+    KernelKind::QuantGemv,
 ];
 
 #[allow(clippy::too_many_arguments)]
@@ -576,6 +578,71 @@ pub mod kernels {
 
             let acc: Tile<f16, { [] }> = convert_tile(acc);
             out.store(acc.reshape(const_shape![1]));
+        }
+    }
+
+    #[cutile::entry(print_ir=false,
+                       unchecked_accesses=true,
+                       optimization_hints = (
+                         sm_120 = (max_divisibility=16,),
+                       ))]
+    unsafe fn gemv_q8_0_soa_f16<const K: i32, const KB: i32, const LATENCY: i32>(
+        out: &mut Tensor<f16, { [8] }>,
+        qs: &Tensor<i8, { [-1, K] }>,
+        scales: &Tensor<f16, { [-1, KB] }>,
+        x: &Tensor<f16, { [-1] }>,
+        num_rows: i32,
+    ) {
+        let row_tile = get_tile_block_id().0;
+        let row_start = row_tile * 8i32;
+        if row_start < num_rows {
+            let qs_part: Partition<i8, { [8, 512] }> = qs.partition(const_shape![8, 512]);
+            let scales_part: Partition<f16, { [8, 16] }> = scales.partition(const_shape![8, 16]);
+            let x_part: Partition<f16, { [512] }> = x.partition(const_shape![512]);
+            let mut acc: Tile<f32, { [8] }> = constant(0.0f32, const_shape![8]);
+
+            for k_tile in 0i32..(K / 512) {
+                let q_i8: Tile<i8, { [8, 512] }> = load_view_tko(
+                    &qs_part,
+                    [row_tile, k_tile],
+                    ordering::Weak,
+                    scope::TileBlock,
+                    Some(LATENCY),
+                    tma::Enabled,
+                );
+                let q: Tile<f32, { [8, 512] }> = convert_tile(q_i8);
+                let x_f16: Tile<f16, { [512] }> = load_view_tko(
+                    &x_part,
+                    [k_tile],
+                    ordering::Weak,
+                    scope::TileBlock,
+                    Some(LATENCY),
+                    tma::Enabled,
+                );
+                let x_tile: Tile<f32, { [512] }> = convert_tile(x_f16);
+                let x_tile: Tile<f32, { [8, 512] }> = x_tile
+                    .reshape(const_shape![1, 512])
+                    .broadcast(const_shape![8, 512]);
+                let prod: Tile<f32, { [8, 512] }> = q * x_tile;
+                let prod: Tile<f32, { [8, 16, 32] }> = prod.reshape(const_shape![8, 16, 32]);
+                let block_sums: Tile<f32, { [8, 16] }> = reduce_sum(prod, 2i32);
+
+                let d_f16: Tile<f16, { [8, 16] }> = load_view_tko(
+                    &scales_part,
+                    [row_tile, k_tile],
+                    ordering::Weak,
+                    scope::TileBlock,
+                    Some(LATENCY),
+                    tma::Enabled,
+                );
+                let d: Tile<f32, { [8, 16] }> = convert_tile(d_f16);
+                let scaled: Tile<f32, { [8, 16] }> = block_sums * d;
+                let chunk_sum: Tile<f32, { [8] }> = reduce_sum(scaled, 1i32);
+                acc = acc + chunk_sum;
+            }
+
+            let acc: Tile<f16, { [8] }> = convert_tile(acc);
+            out.store(acc);
         }
     }
 
@@ -5191,7 +5258,7 @@ pub use kernels::{
     fmha_decode_gqa_split, fmha_prefill_causal, fmha_prefill_gqa, fmha_prefill_gqa_lpt,
     fmha_prefill_gqa_lpt_split, gather_row_f16, gemm_f16, gemv_q4k_f16, gemv_q4k_f16_into,
     gemv_q5k_f16, gemv_q5k_f16_into, gemv_q6k_f16, gemv_q6k_f16_into, gemv_q8_0_f16,
-    gemv_q8_0_f16_into, group_gemm_f16_nt_desc, kv_cache_update_f16,
+    gemv_q8_0_f16_into, gemv_q8_0_soa_f16, group_gemm_f16_nt_desc, kv_cache_update_f16,
     kv_cache_update_seq_dynpos_f16, kv_cache_update_seq_f16, lm_head_argmax_blocks_f16,
     prefill_splitk_reduce_merge, qk_norm_f16, qk_norm_rope_kv_decode_raw_f16,
     qk_norm_rope_kv_prefill_raw_f16, qk_rope_dynpos_f16, rms_norm_f16, rms_norm_persistent_f16,

@@ -12,7 +12,8 @@ use grout::dequant::{GgmlType, dequantize_to_f16, dequantize_to_f32};
 use grout::kernels::{
     add_2d_f16, dequant_q4k_to_f16, dequant_q5k_to_f16, dequant_q6k_to_f16, dequant_q8_0_to_f16,
     embed_gather_q4k_f16, embed_gather_q5k_f16, embed_gather_q6k_f16, embed_gather_q8_0_f16,
-    gemv_q4k_f16, gemv_q5k_f16, gemv_q6k_f16, gemv_q8_0_f16, raw_q8_0_gemv_launch_stream,
+    gemv_q4k_f16, gemv_q5k_f16, gemv_q6k_f16, gemv_q8_0_f16, gemv_q8_0_soa_f16,
+    raw_q8_0_gemv_launch_stream,
 };
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::sync::Arc;
@@ -77,6 +78,25 @@ fn gemv_q8_0_f16_matches_cpu() -> Result<()> {
     for (rows, k, checked_rows) in quant_gemv_shapes() {
         run_q8_0_case(&stream, rows, k, checked_rows)?;
     }
+    Ok(())
+}
+
+#[test]
+#[ignore = "GPU SoA quantized GEMV integration: run with `cargo test gemv_q8_0_soa_f16_matches_cpu -- --ignored` and a visible CUDA device"]
+fn gemv_q8_0_soa_f16_matches_cpu() -> Result<()> {
+    if !cuda_available()? {
+        return Ok(());
+    }
+
+    let device = Device::new(0)?;
+    let stream = device.new_stream()?;
+    run_q8_0_soa_case(&stream, 16, 4096, None)?;
+    run_q8_0_soa_case(
+        &stream,
+        151_936,
+        4096,
+        Some(vec![0usize, 1, 777, 75_968, 151_935]),
+    )?;
     Ok(())
 }
 
@@ -344,6 +364,84 @@ fn run_q8_0_case(
         assert_close(row, actual, expected)?;
     }
     Ok(())
+}
+
+fn run_q8_0_soa_case(
+    stream: &Arc<cuda_core::Stream>,
+    rows: usize,
+    k: usize,
+    checked_rows: Option<Vec<usize>>,
+) -> Result<()> {
+    let dtype = GgmlType::Q8_0;
+    let raw = make_quantized_matrix::<BlockQ8_0>(dtype, rows, k, checked_rows.as_deref())?;
+    let x = make_activation(k);
+    let expected = expected_rows(dtype, &raw, rows, k, &x, checked_rows.as_deref())?;
+    let (qs, scales) = repack_q8_0_soa_host(&raw, rows, k)?;
+
+    let qs_host = Arc::new(qs);
+    let scales_host = Arc::new(scales);
+    let x_host = Arc::new(x);
+    let qs_dev = Arc::new(
+        api::copy_host_vec_to_device(&qs_host)
+            .reshape(&[rows, k])
+            .sync_on(stream)?,
+    );
+    let scales_dev = Arc::new(
+        api::copy_host_vec_to_device(&scales_host)
+            .reshape(&[rows, k / 32])
+            .sync_on(stream)?,
+    );
+    let x_dev = Arc::new(
+        api::copy_host_vec_to_device(&x_host)
+            .reshape(&[k])
+            .sync_on(stream)?,
+    );
+    let out = api::zeros::<f16>(&[rows]).sync_on(stream)?;
+
+    let result = unsafe {
+        gemv_q8_0_soa_f16(
+            value(out.partition([8])),
+            value(qs_dev),
+            value(scales_dev),
+            value(x_dev),
+            value(rows as i32),
+        )
+    }
+    .generics(vec![k.to_string(), (k / 32).to_string(), "1".to_string()])
+    .sync_on(stream)?;
+    let out = result.0.unpartition();
+    let actual = out.to_host_vec().sync_on(stream)?;
+
+    for (row, expected) in expected {
+        let actual = actual[row].to_f32();
+        assert_close(row, actual, expected)?;
+    }
+    Ok(())
+}
+
+fn repack_q8_0_soa_host(raw: &[u8], rows: usize, k: usize) -> Result<(Vec<i8>, Vec<f16>)> {
+    ensure!(k.is_multiple_of(32), "Q8_0 K must be divisible by 32");
+    let blocks_per_row = k / 32;
+    ensure!(
+        raw.len() == rows * blocks_per_row * 34,
+        "Q8_0 raw byte length mismatch"
+    );
+    let mut qs = Vec::with_capacity(rows * k);
+    let mut scales = Vec::with_capacity(rows * blocks_per_row);
+    for row in 0..rows {
+        let row_base = row * blocks_per_row * 34;
+        for block in 0..blocks_per_row {
+            let block_base = row_base + block * 34;
+            scales.push(f16::from_bits(u16::from_le_bytes([
+                raw[block_base],
+                raw[block_base + 1],
+            ])));
+            for j in 0..32 {
+                qs.push(raw[block_base + 2 + j] as i8);
+            }
+        }
+    }
+    Ok((qs, scales))
 }
 
 fn run_raw_q8_0_case(

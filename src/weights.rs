@@ -18,8 +18,20 @@ pub enum Weight {
 
 #[derive(Clone)]
 pub struct QuantizedWeight {
-    pub data: Arc<Tensor<u8>>,
+    pub storage: QuantizedStorage,
     pub shape: Vec<usize>,
+}
+
+#[derive(Clone)]
+pub enum QuantizedStorage {
+    Native {
+        data: Arc<Tensor<u8>>,
+    },
+    Q8_0Soa {
+        native: Arc<Tensor<u8>>,
+        qs: Arc<Tensor<i8>>,
+        scales: Arc<Tensor<f16>>,
+    },
 }
 
 #[derive(Clone)]
@@ -53,7 +65,10 @@ impl Weight {
             "quantized weight raw buffer shape mismatch for {dtype}: got {:?}, expected [{expected_bytes}]",
             data.shape()
         );
-        let q = QuantizedWeight { data, shape };
+        let q = QuantizedWeight {
+            storage: QuantizedStorage::Native { data },
+            shape,
+        };
         match dtype {
             GgmlType::Q8_0 => Ok(Self::Q8_0(q)),
             GgmlType::Q4K => Ok(Self::Q4K(q)),
@@ -61,6 +76,48 @@ impl Weight {
             GgmlType::Q6K => Ok(Self::Q6K(q)),
             other => bail!("unsupported quantized weight type {other}"),
         }
+    }
+
+    pub fn q8_0_soa(
+        native: Arc<Tensor<u8>>,
+        qs: Arc<Tensor<i8>>,
+        scales: Arc<Tensor<f16>>,
+        shape: Vec<usize>,
+    ) -> Result<Self> {
+        ensure!(
+            shape.len() == 2,
+            "Q8_0 SoA weight must be rank-2, got {shape:?}"
+        );
+        let rows = shape[0];
+        let k = shape[1];
+        ensure!(
+            k.is_multiple_of(32),
+            "Q8_0 K must be divisible by 32, got {k}"
+        );
+        let expected_native_bytes = rows
+            .checked_mul(k / 32)
+            .and_then(|blocks| blocks.checked_mul(GgmlType::Q8_0.type_size()))
+            .context("Q8_0 native byte count overflows usize")?;
+        ensure!(
+            native.shape() == [expected_native_bytes as i32],
+            "Q8_0 native buffer shape mismatch: got {:?}, expected [{expected_native_bytes}]",
+            native.shape()
+        );
+        ensure!(
+            qs.shape() == [rows as i32, k as i32],
+            "Q8_0 qs shape mismatch: got {:?}, expected [{rows}, {k}]",
+            qs.shape()
+        );
+        ensure!(
+            scales.shape() == [rows as i32, (k / 32) as i32],
+            "Q8_0 scales shape mismatch: got {:?}, expected [{rows}, {}]",
+            scales.shape(),
+            k / 32
+        );
+        Ok(Self::Q8_0(QuantizedWeight {
+            storage: QuantizedStorage::Q8_0Soa { native, qs, scales },
+            shape,
+        }))
     }
 
     pub fn dtype(&self) -> GgmlType {
@@ -111,6 +168,58 @@ impl Weight {
             Self::Q6K(q) => Some((GgmlType::Q6K, q)),
             Self::F16 { .. } => None,
         }
+    }
+}
+
+impl QuantizedWeight {
+    pub fn native_data(&self) -> Option<&Arc<Tensor<u8>>> {
+        match &self.storage {
+            QuantizedStorage::Native { data } => Some(data),
+            QuantizedStorage::Q8_0Soa { native, .. } => Some(native),
+        }
+    }
+
+    pub fn q8_0_soa(&self) -> Option<(&Arc<Tensor<i8>>, &Arc<Tensor<f16>>)> {
+        match &self.storage {
+            QuantizedStorage::Q8_0Soa { qs, scales, .. } => Some((qs, scales)),
+            QuantizedStorage::Native { .. } => None,
+        }
+    }
+
+    pub fn resident_bytes(&self, dtype: GgmlType) -> Result<usize> {
+        let elems = self.shape[0]
+            .checked_mul(self.shape[1])
+            .context("quantized weight element count overflows usize")?;
+        match &self.storage {
+            QuantizedStorage::Native { data } => Ok(data.size()),
+            QuantizedStorage::Q8_0Soa { native, qs, scales } => {
+                ensure!(
+                    dtype == GgmlType::Q8_0,
+                    "SoA storage is only valid for Q8_0"
+                );
+                let expected = elems / dtype.block_size() * dtype.type_size();
+                let native_bytes = native.size();
+                let soa_bytes = qs.size() * std::mem::size_of::<i8>()
+                    + scales.size() * std::mem::size_of::<f16>();
+                ensure!(
+                    native_bytes == expected,
+                    "Q8_0 native resident bytes mismatch: got {native_bytes}, expected {expected}"
+                );
+                ensure!(
+                    soa_bytes == expected,
+                    "Q8_0 SoA resident bytes mismatch: got {soa_bytes}, expected {expected}"
+                );
+                return Ok(native_bytes + soa_bytes);
+            }
+        }
+        .and_then(|bytes| {
+            let expected = elems / dtype.block_size() * dtype.type_size();
+            ensure!(
+                bytes == expected,
+                "quantized resident bytes mismatch for {dtype}: got {bytes}, expected {expected}"
+            );
+            Ok(bytes)
+        })
     }
 }
 

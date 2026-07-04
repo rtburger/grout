@@ -9,11 +9,10 @@ use crate::kernels::{
     flash_attn_causal_seq_dynpos_f16, flash_attn_causal_seq_f16, fmha_causal,
     fmha_decode_gqa_split, fmha_prefill_causal, fmha_prefill_gqa, fmha_prefill_gqa_lpt,
     gather_row_f16, gemv_q4k_f16, gemv_q4k_f16_into, gemv_q5k_f16, gemv_q5k_f16_into, gemv_q6k_f16,
-    gemv_q6k_f16_into, kv_cache_update_seq_dynpos_f16, kv_cache_update_seq_f16,
+    gemv_q6k_f16_into, gemv_q8_0_soa_f16, kv_cache_update_seq_dynpos_f16, kv_cache_update_seq_f16,
     lm_head_argmax_blocks_f16, qk_norm_f16, qk_norm_rope_kv_decode_raw_f16,
-    qk_norm_rope_kv_prefill_raw_f16, qk_rope_dynpos_f16, raw_q8_0_gemv_launch_ptr,
-    raw_q8_0_gemv_launch_stream, rms_norm_f16, rope_seq_dynpos_f16, rope_seq_f16, silu_mul_2d_f16,
-    splitk_reduce_merge,
+    qk_norm_rope_kv_prefill_raw_f16, qk_rope_dynpos_f16, rms_norm_f16, rope_seq_dynpos_f16,
+    rope_seq_f16, silu_mul_2d_f16, splitk_reduce_merge,
 };
 use crate::loader::WeightLoader;
 use crate::weights::{MatrixWeight, Weight};
@@ -33,7 +32,7 @@ use cutile::tensor::{
 use cutile::tile_kernel::{CompileOptions, TileKernel};
 use rand::Rng;
 use std::cmp::{Reverse, min};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::mem::{MaybeUninit, size_of};
 use std::path::{Path, PathBuf};
@@ -1693,6 +1692,41 @@ impl Qwen3Engine {
         Ok(())
     }
 
+    fn warm_quant_gemv_kernels_ctx(&self, ctx: &ExecutionContext) -> Result<()> {
+        let mut seen = HashSet::new();
+        for part in self.quant_gemv_warmup_parts() {
+            if part.dtype() != crate::dequant::GgmlType::Q8_0 {
+                continue;
+            }
+            let key = (part.dtype(), part.cols());
+            if !seen.insert(key) {
+                continue;
+            }
+            let vector = Arc::new(unsafe { api::zeros::<f16>(&[part.cols()]).execute(ctx)? });
+            let out = alloc_f16_ctx(ctx, &[part.rows()])?;
+            let _ = self.gemv_quant_part_into_tensor_ctx(ctx, &part, &vector, out)?;
+        }
+        Ok(())
+    }
+
+    fn quant_gemv_warmup_parts(&self) -> Vec<Weight> {
+        let mut parts = Vec::new();
+        for matrix in [&self.embed_tokens, &self.lm_head] {
+            parts.extend(matrix.parts().iter().cloned());
+        }
+        for layer in &self.layers {
+            for matrix in [
+                &layer.weights.qkv_proj,
+                &layer.weights.o_proj,
+                &layer.weights.gate_up_proj,
+                &layer.weights.down_proj,
+            ] {
+                parts.extend(matrix.parts().iter().cloned());
+            }
+        }
+        parts
+    }
+
     fn warm_tile_kernel_ctx(&mut self, ctx: &ExecutionContext, kind: KernelKind) -> Result<()> {
         if self.kernel_warm_registry.is_warmed(kind) {
             return Ok(());
@@ -1923,6 +1957,9 @@ impl Qwen3Engine {
                     .grid(((attn_heads + kv_heads) as u32, 2u32, 1u32))
                     .execute(ctx)?
                 };
+            }
+            KernelKind::QuantGemv => {
+                self.warm_quant_gemv_kernels_ctx(ctx)?;
             }
             KernelKind::ArgmaxReduceBlocks => {
                 let argmax_block = env_usize_or("GROUT_ARGMAX_BLOCK", ARGMAX_BLOCK);
@@ -4860,33 +4897,36 @@ impl Qwen3Engine {
             | crate::dequant::GgmlType::Q5K => 32usize,
             other => bail!("unsupported quantized embedding type {other}"),
         };
+        let native_data = quant
+            .native_data()
+            .with_context(|| format!("{dtype} embedding gather still requires native layout"))?;
         let out_part = out.partition([1, tile_elems]);
         let result = unsafe {
             match dtype {
                 crate::dequant::GgmlType::Q8_0 => embed_gather_q8_0_f16(
                     value(token_ids),
-                    value(quant.data.clone()),
+                    value(native_data.clone()),
                     value(out_part),
                 )
                 .generics(vec![self.cfg.hidden_size.to_string()])
                 .execute(ctx)?,
                 crate::dequant::GgmlType::Q4K => embed_gather_q4k_f16(
                     value(token_ids),
-                    value(quant.data.clone()),
+                    value(native_data.clone()),
                     value(out_part),
                 )
                 .generics(vec![self.cfg.hidden_size.to_string()])
                 .execute(ctx)?,
                 crate::dequant::GgmlType::Q6K => embed_gather_q6k_f16(
                     value(token_ids),
-                    value(quant.data.clone()),
+                    value(native_data.clone()),
                     value(out_part),
                 )
                 .generics(vec![self.cfg.hidden_size.to_string()])
                 .execute(ctx)?,
                 crate::dequant::GgmlType::Q5K => embed_gather_q5k_f16(
                     value(token_ids),
-                    value(quant.data.clone()),
+                    value(native_data.clone()),
                     value(out_part),
                 )
                 .generics(vec![self.cfg.hidden_size.to_string()])
@@ -5086,24 +5126,43 @@ impl Qwen3Engine {
         );
         ensure!(part.cols() <= i32::MAX as usize, "GEMV K too large");
         if dtype == crate::dequant::GgmlType::Q8_0 {
-            let mut out = out;
-            raw_q8_0_gemv_launch_stream(
-                ctx.get_cuda_stream(),
-                &quant.data,
-                vector,
-                &mut out,
-                part.rows(),
-                part.cols(),
-            )
-            .context("raw q8_0 GEMV failed")?;
-            return Ok(out);
+            let (qs, scales) = quant.q8_0_soa().context("Q8_0 GEMV requires SoA layout")?;
+            ensure!(
+                part.cols().is_multiple_of(512),
+                "Q8_0 v2 K must be divisible by BK=512"
+            );
+            ensure!(
+                part.rows().is_multiple_of(8),
+                "Q8_0 v2 rows must be divisible by R=8"
+            );
+            let result = unsafe {
+                gemv_q8_0_soa_f16(
+                    value(out.partition([8])),
+                    value(qs.clone()),
+                    value(scales.clone()),
+                    value(vector.clone()),
+                    value(part.rows() as i32),
+                )
+                .generics(vec![
+                    part.cols().to_string(),
+                    (part.cols() / 32).to_string(),
+                    "1".to_string(),
+                ])
+                .grid(((part.rows() / 8) as u32, 1u32, 1u32))
+                .compile_options(CompileOptions::default().occupancy(4))
+                .execute(ctx)?
+            };
+            return Ok(result.0.unpartition());
         }
+        let native_data = quant
+            .native_data()
+            .with_context(|| format!("{dtype} GEMV requires native layout"))?;
         let out_part = out.partition([1]);
         let result = unsafe {
             match dtype {
                 crate::dequant::GgmlType::Q4K => gemv_q4k_f16(
                     value(out_part),
-                    value(quant.data.clone()),
+                    value(native_data.clone()),
                     value(vector.clone()),
                 )
                 .generics(vec![part.cols().to_string()])
@@ -5111,7 +5170,7 @@ impl Qwen3Engine {
                 .execute(ctx)?,
                 crate::dequant::GgmlType::Q6K => gemv_q6k_f16(
                     value(out_part),
-                    value(quant.data.clone()),
+                    value(native_data.clone()),
                     value(vector.clone()),
                 )
                 .generics(vec![part.cols().to_string()])
@@ -5119,7 +5178,7 @@ impl Qwen3Engine {
                 .execute(ctx)?,
                 crate::dequant::GgmlType::Q5K => gemv_q5k_f16(
                     value(out_part),
-                    value(quant.data.clone()),
+                    value(native_data.clone()),
                     value(vector.clone()),
                 )
                 .generics(vec![part.cols().to_string()])
@@ -5207,30 +5266,33 @@ impl Qwen3Engine {
             num_tiles <= i32::MAX as usize,
             "dequant tile count too large"
         );
+        let native_data = quant
+            .native_data()
+            .with_context(|| format!("{dtype} prefill dequant requires native layout"))?;
         let num_tiles = num_tiles as i32;
         unsafe {
             match dtype {
                 crate::dequant::GgmlType::Q8_0 => dequant_q8_0_to_f16(
                     (&mut *scratch).partition([tile_elems]),
-                    &*quant.data,
+                    &**native_data,
                     num_tiles,
                 )
                 .execute(ctx)?,
                 crate::dequant::GgmlType::Q4K => dequant_q4k_to_f16(
                     (&mut *scratch).partition([tile_elems]),
-                    &*quant.data,
+                    &**native_data,
                     num_tiles,
                 )
                 .execute(ctx)?,
                 crate::dequant::GgmlType::Q6K => dequant_q6k_to_f16(
                     (&mut *scratch).partition([tile_elems]),
-                    &*quant.data,
+                    &**native_data,
                     num_tiles,
                 )
                 .execute(ctx)?,
                 crate::dequant::GgmlType::Q5K => dequant_q5k_to_f16(
                     (&mut *scratch).partition([tile_elems]),
-                    &*quant.data,
+                    &**native_data,
                     num_tiles,
                 )
                 .execute(ctx)?,
@@ -5266,12 +5328,15 @@ impl Qwen3Engine {
                 } else {
                     32usize
                 };
+                let native_data = quant
+                    .native_data()
+                    .with_context(|| format!("{dtype} decode embedding requires native layout"))?;
                 unsafe {
                     match dtype {
                         crate::dequant::GgmlType::Q8_0 => {
                             embed_gather_q8_0_f16(
                                 token_ids,
-                                &*quant.data,
+                                &**native_data,
                                 out.partition([1, tile]),
                             )
                             .generics(vec![self.cfg.hidden_size.to_string()])
@@ -5279,28 +5344,34 @@ impl Qwen3Engine {
                             .map_err(|e| anyhow::anyhow!("decode q8_0 embedding failed: {e:?}"))?;
                         }
                         crate::dequant::GgmlType::Q4K => {
-                            embed_gather_q4k_f16(token_ids, &*quant.data, out.partition([1, tile]))
-                                .generics(vec![self.cfg.hidden_size.to_string()])
-                                .sync_on(stream)
-                                .map_err(|e| {
-                                    anyhow::anyhow!("decode q4k embedding failed: {e:?}")
-                                })?;
+                            embed_gather_q4k_f16(
+                                token_ids,
+                                &**native_data,
+                                out.partition([1, tile]),
+                            )
+                            .generics(vec![self.cfg.hidden_size.to_string()])
+                            .sync_on(stream)
+                            .map_err(|e| anyhow::anyhow!("decode q4k embedding failed: {e:?}"))?;
                         }
                         crate::dequant::GgmlType::Q6K => {
-                            embed_gather_q6k_f16(token_ids, &*quant.data, out.partition([1, tile]))
-                                .generics(vec![self.cfg.hidden_size.to_string()])
-                                .sync_on(stream)
-                                .map_err(|e| {
-                                    anyhow::anyhow!("decode q6k embedding failed: {e:?}")
-                                })?;
+                            embed_gather_q6k_f16(
+                                token_ids,
+                                &**native_data,
+                                out.partition([1, tile]),
+                            )
+                            .generics(vec![self.cfg.hidden_size.to_string()])
+                            .sync_on(stream)
+                            .map_err(|e| anyhow::anyhow!("decode q6k embedding failed: {e:?}"))?;
                         }
                         crate::dequant::GgmlType::Q5K => {
-                            embed_gather_q5k_f16(token_ids, &*quant.data, out.partition([1, tile]))
-                                .generics(vec![self.cfg.hidden_size.to_string()])
-                                .sync_on(stream)
-                                .map_err(|e| {
-                                    anyhow::anyhow!("decode q5k embedding failed: {e:?}")
-                                })?;
+                            embed_gather_q5k_f16(
+                                token_ids,
+                                &**native_data,
+                                out.partition([1, tile]),
+                            )
+                            .generics(vec![self.cfg.hidden_size.to_string()])
+                            .sync_on(stream)
+                            .map_err(|e| anyhow::anyhow!("decode q5k embedding failed: {e:?}"))?;
                         }
                         other => bail!("unsupported quantized embedding type {other}"),
                     }
@@ -5337,13 +5408,18 @@ impl Qwen3Engine {
                 } else {
                     32usize
                 };
+                let native_data = quant.native_data().ok_or_else(|| {
+                    DeviceError::Internal(format!(
+                        "{dtype} decode embedding requires native layout"
+                    ))
+                })?;
                 match dtype {
                     crate::dequant::GgmlType::Q8_0 => {
                         s.record(
                             unsafe {
                                 embed_gather_q8_0_f16(
                                     token_ids,
-                                    &*quant.data,
+                                    &**native_data,
                                     out.partition([1, tile]),
                                 )
                             }
@@ -5355,7 +5431,7 @@ impl Qwen3Engine {
                             unsafe {
                                 embed_gather_q4k_f16(
                                     token_ids,
-                                    &*quant.data,
+                                    &**native_data,
                                     out.partition([1, tile]),
                                 )
                             }
@@ -5367,7 +5443,7 @@ impl Qwen3Engine {
                             unsafe {
                                 embed_gather_q6k_f16(
                                     token_ids,
-                                    &*quant.data,
+                                    &**native_data,
                                     out.partition([1, tile]),
                                 )
                             }
@@ -5379,7 +5455,7 @@ impl Qwen3Engine {
                             unsafe {
                                 embed_gather_q5k_f16(
                                     token_ids,
-                                    &*quant.data,
+                                    &**native_data,
                                     out.partition([1, tile]),
                                 )
                             }
@@ -5524,7 +5600,7 @@ impl Qwen3Engine {
         &self,
         s: &Scope,
         part: &Weight,
-        vector_f16: &Tensor<f16>,
+        _vector_f16: &Tensor<f16>,
         vector: &TensorView<'_, f16>,
         out: &mut Tensor<f16>,
         label: &str,
@@ -5534,54 +5610,63 @@ impl Qwen3Engine {
         })?;
         match dtype {
             crate::dequant::GgmlType::Q8_0 => {
-                let w_ptr = quant.data.device_pointer().cu_deviceptr();
-                let x_ptr = vector_f16.device_pointer().cu_deviceptr();
-                let out_ptr = out.device_pointer().cu_deviceptr();
-                let rows = part.rows();
-                let k = part.cols();
-                let label = label.to_string();
-                s.record(KernelGraphOp(move |ctx: &ExecutionContext| {
-                    raw_q8_0_gemv_launch_ptr(ctx.get_cuda_stream(), w_ptr, x_ptr, out_ptr, rows, k)
-                        .map_err(|e| {
-                            DeviceError::Internal(format!("{label} q8_0 raw gemv failed: {e:#}"))
-                        })
-                }))?;
-            }
-            crate::dequant::GgmlType::Q4K => {
+                let (qs, scales) = quant.q8_0_soa().ok_or_else(|| {
+                    DeviceError::Internal(format!("{label}: Q8_0 GEMV requires SoA layout"))
+                })?;
+                if !part.cols().is_multiple_of(512) || !part.rows().is_multiple_of(8) {
+                    return Err(DeviceError::Internal(format!(
+                        "{label}: Q8_0 v2 requires rows multiple of 8 and K multiple of 512, got rows={}, K={}",
+                        part.rows(),
+                        part.cols()
+                    )));
+                }
                 s.record(
                     unsafe {
-                        gemv_q4k_f16_into(
-                            out.partition([1]),
-                            &*quant.data,
+                        gemv_q8_0_soa_f16(
+                            out.partition([8]),
+                            &**qs,
+                            &**scales,
                             vector,
                             part.rows() as i32,
                         )
+                    }
+                    .generics(vec![
+                        part.cols().to_string(),
+                        (part.cols() / 32).to_string(),
+                        "1".to_string(),
+                    ])
+                    .compile_options(CompileOptions::default().occupancy(4)),
+                )?;
+            }
+            crate::dequant::GgmlType::Q4K => {
+                let data = quant.native_data().ok_or_else(|| {
+                    DeviceError::Internal(format!("{label}: Q4K GEMV requires native layout"))
+                })?;
+                s.record(
+                    unsafe {
+                        gemv_q4k_f16_into(out.partition([1]), &**data, vector, part.rows() as i32)
                     }
                     .generics(vec![part.cols().to_string()]),
                 )?;
             }
             crate::dequant::GgmlType::Q6K => {
+                let data = quant.native_data().ok_or_else(|| {
+                    DeviceError::Internal(format!("{label}: Q6K GEMV requires native layout"))
+                })?;
                 s.record(
                     unsafe {
-                        gemv_q6k_f16_into(
-                            out.partition([1]),
-                            &*quant.data,
-                            vector,
-                            part.rows() as i32,
-                        )
+                        gemv_q6k_f16_into(out.partition([1]), &**data, vector, part.rows() as i32)
                     }
                     .generics(vec![part.cols().to_string()]),
                 )?;
             }
             crate::dequant::GgmlType::Q5K => {
+                let data = quant.native_data().ok_or_else(|| {
+                    DeviceError::Internal(format!("{label}: Q5K GEMV requires native layout"))
+                })?;
                 s.record(
                     unsafe {
-                        gemv_q5k_f16_into(
-                            out.partition([1]),
-                            &*quant.data,
-                            vector,
-                            part.rows() as i32,
-                        )
+                        gemv_q5k_f16_into(out.partition([1]), &**data, vector, part.rows() as i32)
                     }
                     .generics(vec![part.cols().to_string()]),
                 )?;
@@ -5599,7 +5684,7 @@ impl Qwen3Engine {
         &self,
         stream: &Arc<cuda_core::Stream>,
         part: &Weight,
-        vector_f16: &Tensor<f16>,
+        _vector_f16: &Tensor<f16>,
         vector: &TensorView<'_, f16>,
         out: &mut Tensor<f16>,
         label: &str,
@@ -5610,30 +5695,54 @@ impl Qwen3Engine {
         unsafe {
             match dtype {
                 crate::dequant::GgmlType::Q8_0 => {
-                    raw_q8_0_gemv_launch_stream(
-                        stream,
-                        &quant.data,
-                        vector_f16,
-                        out,
-                        part.rows(),
-                        part.cols(),
+                    let (qs, scales) = quant.q8_0_soa().context("Q8_0 GEMV requires SoA layout")?;
+                    ensure!(
+                        part.cols().is_multiple_of(512),
+                        "Q8_0 v2 K must be divisible by BK=512"
+                    );
+                    ensure!(
+                        part.rows().is_multiple_of(8),
+                        "Q8_0 v2 rows must be divisible by R=8"
+                    );
+                    gemv_q8_0_soa_f16(
+                        out.partition([8]),
+                        &**qs,
+                        &**scales,
+                        vector,
+                        part.rows() as i32,
                     )
-                    .map_err(|e| anyhow::anyhow!("{label} q8_0 raw gemv failed: {e:#}"))?;
+                    .generics(vec![
+                        part.cols().to_string(),
+                        (part.cols() / 32).to_string(),
+                        "1".to_string(),
+                    ])
+                    .compile_options(CompileOptions::default().occupancy(4))
+                    .sync_on(stream)
+                    .map_err(|e| anyhow::anyhow!("{label} q8_0 soa gemv failed: {e:?}"))?;
                 }
                 crate::dequant::GgmlType::Q4K => {
-                    gemv_q4k_f16_into(out.partition([1]), &*quant.data, vector, part.rows() as i32)
+                    let data = quant
+                        .native_data()
+                        .context("Q4K GEMV requires native layout")?;
+                    gemv_q4k_f16_into(out.partition([1]), &**data, vector, part.rows() as i32)
                         .generics(vec![part.cols().to_string()])
                         .sync_on(stream)
                         .map_err(|e| anyhow::anyhow!("{label} q4k gemv failed: {e:?}"))?;
                 }
                 crate::dequant::GgmlType::Q6K => {
-                    gemv_q6k_f16_into(out.partition([1]), &*quant.data, vector, part.rows() as i32)
+                    let data = quant
+                        .native_data()
+                        .context("Q6K GEMV requires native layout")?;
+                    gemv_q6k_f16_into(out.partition([1]), &**data, vector, part.rows() as i32)
                         .generics(vec![part.cols().to_string()])
                         .sync_on(stream)
                         .map_err(|e| anyhow::anyhow!("{label} q6k gemv failed: {e:?}"))?;
                 }
                 crate::dequant::GgmlType::Q5K => {
-                    gemv_q5k_f16_into(out.partition([1]), &*quant.data, vector, part.rows() as i32)
+                    let data = quant
+                        .native_data()
+                        .context("Q5K GEMV requires native layout")?;
+                    gemv_q5k_f16_into(out.partition([1]), &**data, vector, part.rows() as i32)
                         .generics(vec![part.cols().to_string()])
                         .sync_on(stream)
                         .map_err(|e| anyhow::anyhow!("{label} q5k gemv failed: {e:?}"))?;

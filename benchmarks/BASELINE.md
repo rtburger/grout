@@ -227,3 +227,55 @@ Correctness gate added for this backend:
 ```bash
 cargo test raw_gemv_q8_0_f16_matches_cpu --test kernels -- --ignored --nocapture
 ```
+
+## Phase 2 Q8_0 SoA tile-native decode-GEMV checkpoint
+
+Run mode for this synthetic Q8_0 checkpoint: desktop/display-attached.
+
+Version block:
+
+- Driver: 595.58.03
+- CUDA toolkit: Arch `cuda` package 13.3.1-1; `/opt/cuda/bin/nvcc` CUDA 13.3, V13.3.73
+- tileiras: `/opt/cuda/bin/tileiras`, CUDA Tile IR assembler 13.3, V13.3.36
+- GPU: NVIDIA GeForce RTX 4070, 12 GB, sm_89, 46 SMs
+
+Context: Q8_0 runtime weights are repacked at GGUF load into SoA device tensors
+(`qs: [rows,k] i8`, `scales: [rows,k/32] f16`) for decode GEMV, while native bytes
+are retained for unported dequant/embed paths. Decode uses the tile-native/TMA kernel
+`gemv_q8_0_soa_f16` with `R=8`, `BK=512`, `block_scales=16`, `LATENCY=1`.
+The synthetic microbench sweeps cuTile compile-option occupancy `{1,2,4}` at
+Qwen3-8B matrix shapes. Bytes are `qs bytes + scale bytes + fp16_activation_bytes + fp16_output_bytes`.
+
+Command:
+
+```bash
+CUDA_TOOLKIT_PATH=/opt/cuda CUTILE_TILEIRAS_PATH=/opt/cuda/bin/tileiras \
+  target/release/q8_0_soa_microbench --iters 20 --warmup-iters 5
+```
+
+| backend | rows | k | occupancy | avg us | achieved GB/s |
+|---|---:|---:|---:|---:|---:|
+| Q8_0 SoA tile | 4096 | 4096 | 1 | 28.518 | 625.637 |
+| Q8_0 SoA tile | 1024 | 4096 | 1 | 7.373 | 605.833 |
+| Q8_0 SoA tile | 12288 | 4096 | 1 | 131.317 | 407.489 |
+| Q8_0 SoA tile | 4096 | 12288 | 1 | 135.227 | 395.705 |
+| Q8_0 SoA tile | 151936 | 4096 | 1 | 1502.771 | 440.212 |
+| Q8_0 SoA tile | 4096 | 4096 | 2 | 19.158 | 931.298 |
+| Q8_0 SoA tile | 1024 | 4096 | 2 | 7.629 | 585.503 |
+| Q8_0 SoA tile | 12288 | 4096 | 2 | 116.330 | 459.987 |
+| Q8_0 SoA tile | 4096 | 12288 | 2 | 152.474 | 350.947 |
+| Q8_0 SoA tile | 151936 | 4096 | 2 | 1489.078 | 444.260 |
+| Q8_0 SoA tile | 4096 | 4096 | 4 | 21.402 | 833.684 |
+| Q8_0 SoA tile | 1024 | 4096 | 4 | 8.194 | 545.144 |
+| Q8_0 SoA tile | 12288 | 4096 | 4 | 116.634 | 458.788 |
+| Q8_0 SoA tile | 4096 | 12288 | 4 | 136.038 | 393.346 |
+| Q8_0 SoA tile | 151936 | 4096 | 4 | 1486.848 | 444.926 |
+
+All swept Q8_0 SoA 8B-shape rows exceed the temporary `>300 GB/s` checkpoint.
+The engine uses the occupancy-4 specialization for graph/eager Q8_0 GEMV dispatch.
+
+Correctness gate added for this backend:
+
+```bash
+cargo test gemv_q8_0_soa_f16_matches_cpu --test kernels -- --ignored --nocapture
+```
