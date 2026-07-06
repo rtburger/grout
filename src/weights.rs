@@ -32,6 +32,28 @@ pub enum QuantizedStorage {
         qs: Arc<Tensor<i8>>,
         scales: Arc<Tensor<f16>>,
     },
+    // Q6K SoA decode layout: qs holds the 6-bit value minus 32 in element
+    // order, sc the per-16-element i8 sub-scales (native order), d the
+    // per-256-element f16 super-scales. `native` is retained only when the
+    // tensor also serves the native-layout embedding gather (tied embeddings).
+    Q6KSoa {
+        native: Option<Arc<Tensor<u8>>>,
+        qs: Arc<Tensor<i8>>,   // [rows, k]
+        sc: Arc<Tensor<i8>>,   // [rows, k/16]
+        d: Arc<Tensor<f16>>,   // [rows, k/256]
+    },
+    // Q4K SoA decode layout: qs is plane-packed nibbles (byte j of a row
+    // holds element j in the low nibble and element j + k/2 in the high
+    // nibble), sc/mins the unpacked 6-bit per-32-element scales/mins, d/dmin
+    // the per-256-element f16 super-scales.
+    Q4KSoa {
+        native: Option<Arc<Tensor<u8>>>,
+        qs: Arc<Tensor<u8>>,   // [rows, k/2]
+        sc: Arc<Tensor<u8>>,   // [rows, k/32]
+        mins: Arc<Tensor<u8>>, // [rows, k/32]
+        d: Arc<Tensor<f16>>,   // [rows, k/256]
+        dmin: Arc<Tensor<f16>>, // [rows, k/256]
+    },
 }
 
 #[derive(Clone)]
@@ -109,6 +131,98 @@ impl Weight {
         }))
     }
 
+    pub fn q6k_soa(
+        native: Option<Arc<Tensor<u8>>>,
+        qs: Arc<Tensor<i8>>,
+        sc: Arc<Tensor<i8>>,
+        d: Arc<Tensor<f16>>,
+        shape: Vec<usize>,
+    ) -> Result<Self> {
+        let (rows, k) = soa_dims(GgmlType::Q6K, &shape)?;
+        if let Some(native) = &native {
+            let expected = rows * (k / 256) * GgmlType::Q6K.type_size();
+            ensure!(
+                native.shape() == [expected as i32],
+                "Q6K native buffer shape mismatch: got {:?}, expected [{expected}]",
+                native.shape()
+            );
+        }
+        ensure!(
+            qs.shape() == [rows as i32, k as i32],
+            "Q6K qs shape mismatch: got {:?}, expected [{rows}, {k}]",
+            qs.shape()
+        );
+        ensure!(
+            sc.shape() == [rows as i32, (k / 16) as i32],
+            "Q6K sc shape mismatch: got {:?}, expected [{rows}, {}]",
+            sc.shape(),
+            k / 16
+        );
+        ensure!(
+            d.shape() == [rows as i32, (k / 256) as i32],
+            "Q6K d shape mismatch: got {:?}, expected [{rows}, {}]",
+            d.shape(),
+            k / 256
+        );
+        Ok(Self::Q6K(QuantizedWeight {
+            storage: QuantizedStorage::Q6KSoa { native, qs, sc, d },
+            shape,
+        }))
+    }
+
+    pub fn q4k_soa(
+        native: Option<Arc<Tensor<u8>>>,
+        qs: Arc<Tensor<u8>>,
+        sc: Arc<Tensor<u8>>,
+        mins: Arc<Tensor<u8>>,
+        d: Arc<Tensor<f16>>,
+        dmin: Arc<Tensor<f16>>,
+        shape: Vec<usize>,
+    ) -> Result<Self> {
+        let (rows, k) = soa_dims(GgmlType::Q4K, &shape)?;
+        if let Some(native) = &native {
+            let expected = rows * (k / 256) * GgmlType::Q4K.type_size();
+            ensure!(
+                native.shape() == [expected as i32],
+                "Q4K native buffer shape mismatch: got {:?}, expected [{expected}]",
+                native.shape()
+            );
+        }
+        ensure!(
+            qs.shape() == [rows as i32, (k / 2) as i32],
+            "Q4K qs shape mismatch: got {:?}, expected [{rows}, {}]",
+            qs.shape(),
+            k / 2
+        );
+        for (name, t) in [("sc", &sc), ("mins", &mins)] {
+            ensure!(
+                t.shape() == [rows as i32, (k / 32) as i32],
+                "Q4K {name} shape mismatch: got {:?}, expected [{rows}, {}]",
+                t.shape(),
+                k / 32
+            );
+        }
+        for (name, t) in [("d", &d), ("dmin", &dmin)] {
+            ensure!(
+                t.shape() == [rows as i32, (k / 256) as i32],
+                "Q4K {name} shape mismatch: got {:?}, expected [{rows}, {}]",
+                t.shape(),
+                k / 256
+            );
+        }
+        Ok(Self::Q4K(QuantizedWeight {
+            storage: QuantizedStorage::Q4KSoa {
+                native,
+                qs,
+                sc,
+                mins,
+                d,
+                dmin,
+            },
+            shape,
+        }))
+    }
+
     pub fn dtype(&self) -> GgmlType {
         match self {
             Self::F16 { .. } => GgmlType::F16,
@@ -165,13 +279,45 @@ impl QuantizedWeight {
         match &self.storage {
             QuantizedStorage::Native { data } => Some(data),
             QuantizedStorage::Q8_0Soa { native, .. } => Some(native),
+            QuantizedStorage::Q6KSoa { native, .. } => native.as_ref(),
+            QuantizedStorage::Q4KSoa { native, .. } => native.as_ref(),
         }
     }
 
     pub fn q8_0_soa(&self) -> Option<(&Arc<Tensor<i8>>, &Arc<Tensor<f16>>)> {
         match &self.storage {
             QuantizedStorage::Q8_0Soa { qs, scales, .. } => Some((qs, scales)),
-            QuantizedStorage::Native { .. } => None,
+            _ => None,
+        }
+    }
+
+    pub fn q6k_soa(&self) -> Option<(&Arc<Tensor<i8>>, &Arc<Tensor<i8>>, &Arc<Tensor<f16>>)> {
+        match &self.storage {
+            QuantizedStorage::Q6KSoa { qs, sc, d, .. } => Some((qs, sc, d)),
+            _ => None,
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn q4k_soa(
+        &self,
+    ) -> Option<(
+        &Arc<Tensor<u8>>,
+        &Arc<Tensor<u8>>,
+        &Arc<Tensor<u8>>,
+        &Arc<Tensor<f16>>,
+        &Arc<Tensor<f16>>,
+    )> {
+        match &self.storage {
+            QuantizedStorage::Q4KSoa {
+                qs,
+                sc,
+                mins,
+                d,
+                dmin,
+                ..
+            } => Some((qs, sc, mins, d, dmin)),
+            _ => None,
         }
     }
 
@@ -179,37 +325,95 @@ impl QuantizedWeight {
         let elems = self.shape[0]
             .checked_mul(self.shape[1])
             .context("quantized weight element count overflows usize")?;
+        let native_expected = elems / dtype.block_size() * dtype.type_size();
         match &self.storage {
-            QuantizedStorage::Native { data } => Ok(data.size()),
+            QuantizedStorage::Native { data } => {
+                let bytes = data.size();
+                ensure!(
+                    bytes == native_expected,
+                    "quantized resident bytes mismatch for {dtype}: got {bytes}, expected {native_expected}"
+                );
+                Ok(bytes)
+            }
             QuantizedStorage::Q8_0Soa { native, qs, scales } => {
                 ensure!(
                     dtype == GgmlType::Q8_0,
-                    "SoA storage is only valid for Q8_0"
+                    "Q8_0 SoA storage is only valid for Q8_0"
                 );
-                let expected = elems / dtype.block_size() * dtype.type_size();
                 let native_bytes = native.size();
                 let soa_bytes = qs.size() * std::mem::size_of::<i8>()
                     + scales.size() * std::mem::size_of::<f16>();
                 ensure!(
-                    native_bytes == expected,
-                    "Q8_0 native resident bytes mismatch: got {native_bytes}, expected {expected}"
+                    native_bytes == native_expected,
+                    "Q8_0 native resident bytes mismatch: got {native_bytes}, expected {native_expected}"
                 );
                 ensure!(
-                    soa_bytes == expected,
-                    "Q8_0 SoA resident bytes mismatch: got {soa_bytes}, expected {expected}"
+                    soa_bytes == native_expected,
+                    "Q8_0 SoA resident bytes mismatch: got {soa_bytes}, expected {native_expected}"
                 );
-                return Ok(native_bytes + soa_bytes);
+                Ok(native_bytes + soa_bytes)
+            }
+            QuantizedStorage::Q6KSoa { native, qs, sc, d } => {
+                ensure!(
+                    dtype == GgmlType::Q6K,
+                    "Q6K SoA storage is only valid for Q6K"
+                );
+                let native_bytes = native.as_ref().map(|t| t.size()).unwrap_or(0);
+                let soa_bytes =
+                    qs.size() + sc.size() + d.size() * std::mem::size_of::<f16>();
+                let soa_expected = elems + elems / 16 + elems / 256 * 2;
+                ensure!(
+                    soa_bytes == soa_expected,
+                    "Q6K SoA resident bytes mismatch: got {soa_bytes}, expected {soa_expected}"
+                );
+                Ok(native_bytes + soa_bytes)
+            }
+            QuantizedStorage::Q4KSoa {
+                native,
+                qs,
+                sc,
+                mins,
+                d,
+                dmin,
+            } => {
+                ensure!(
+                    dtype == GgmlType::Q4K,
+                    "Q4K SoA storage is only valid for Q4K"
+                );
+                let native_bytes = native.as_ref().map(|t| t.size()).unwrap_or(0);
+                let soa_bytes = qs.size()
+                    + sc.size()
+                    + mins.size()
+                    + (d.size() + dmin.size()) * std::mem::size_of::<f16>();
+                let soa_expected = elems / 2 + elems / 32 * 2 + elems / 256 * 4;
+                ensure!(
+                    soa_bytes == soa_expected,
+                    "Q4K SoA resident bytes mismatch: got {soa_bytes}, expected {soa_expected}"
+                );
+                Ok(native_bytes + soa_bytes)
             }
         }
-        .and_then(|bytes| {
-            let expected = elems / dtype.block_size() * dtype.type_size();
-            ensure!(
-                bytes == expected,
-                "quantized resident bytes mismatch for {dtype}: got {bytes}, expected {expected}"
-            );
-            Ok(bytes)
-        })
     }
+}
+
+/// Validate an SoA weight shape: rank-2, K divisible by 512 (kernel K-tile)
+/// and rows divisible by 8 (kernel row tile), returning (rows, k).
+fn soa_dims(dtype: GgmlType, shape: &[usize]) -> Result<(usize, usize)> {
+    ensure!(
+        shape.len() == 2,
+        "{dtype} SoA weight must be rank-2, got {shape:?}"
+    );
+    let rows = shape[0];
+    let k = shape[1];
+    ensure!(
+        k.is_multiple_of(512),
+        "{dtype} SoA K must be divisible by 512, got {k}"
+    );
+    ensure!(
+        rows.is_multiple_of(8),
+        "{dtype} SoA rows must be divisible by 8, got {rows}"
+    );
+    Ok((rows, k))
 }
 
 impl MatrixWeight {

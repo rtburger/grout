@@ -10,10 +10,11 @@ use cutile::tensor::{IntoPartition, ToHostVec};
 use cutile::tile_kernel::TileKernel;
 use grout::dequant::{GgmlType, dequantize_to_f16, dequantize_to_f32};
 use grout::kernels::{
-    add_2d_f16, dequant_q4k_to_f16, dequant_q5k_to_f16, dequant_q6k_to_f16, dequant_q8_0_to_f16,
-    embed_gather_q4k_f16, embed_gather_q5k_f16, embed_gather_q6k_f16, embed_gather_q8_0_f16,
-    gemv_q4k_f16, gemv_q5k_f16, gemv_q6k_f16, gemv_q8_0_f16, gemv_q8_0_soa_f16,
-    raw_q8_0_gemv_launch_stream,
+    add_2d_f16, dequant_q4k_soa_to_f16, dequant_q4k_to_f16, dequant_q5k_to_f16,
+    dequant_q6k_soa_to_f16, dequant_q6k_to_f16, dequant_q8_0_to_f16, embed_gather_q4k_f16,
+    embed_gather_q5k_f16, embed_gather_q6k_f16, embed_gather_q8_0_f16, gemv_q4k_f16,
+    gemv_q4k_soa_f16, gemv_q5k_f16, gemv_q6k_f16, gemv_q6k_soa_f16, gemv_q8_0_f16,
+    gemv_q8_0_soa_f16, raw_q8_0_gemv_launch_stream,
 };
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::sync::Arc;
@@ -1109,3 +1110,317 @@ fn assert_close(row: usize, actual: f32, expected: f32) -> Result<()> {
     );
     Ok(())
 }
+
+// ─── K-quant SoA decode layout: repack + tile-parallel kernels ──────────────
+
+#[test]
+fn repack_q6k_soa_reconstructs_reference() -> Result<()> {
+    let rows = 3usize;
+    let k = 512usize;
+    let raw = make_quantized_matrix::<BlockQ6K>(GgmlType::Q6K, rows, k, None)?;
+    let (qs, sc, d) = grout::loader::repack_q6k_soa_host(&raw, rows, k)?;
+    let reference = dequantize_to_f32(GgmlType::Q6K, &raw, rows * k, "q6k repack")?;
+    for (e, &expected) in reference.iter().enumerate() {
+        let recon = d[e / 256].to_f32() * (sc[e / 16] as f32) * (qs[e] as f32);
+        let tol = 1.0e-5f32 * expected.abs().max(1.0);
+        ensure!(
+            (recon - expected).abs() <= tol,
+            "elem {e}: repacked {recon} expected {expected}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn repack_q4k_soa_reconstructs_reference() -> Result<()> {
+    let rows = 3usize;
+    let k = 512usize;
+    let raw = make_quantized_matrix::<BlockQ4K>(GgmlType::Q4K, rows, k, None)?;
+    let (qs, sc, mins, d, dmin) = grout::loader::repack_q4k_soa_host(&raw, rows, k)?;
+    let reference = dequantize_to_f32(GgmlType::Q4K, &raw, rows * k, "q4k repack")?;
+    let half_k = k / 2;
+    for (e, &expected) in reference.iter().enumerate() {
+        let row = e / k;
+        let pos = e % k;
+        let byte = qs[row * half_k + pos % half_k];
+        let q = if pos < half_k { byte & 0xF } else { byte >> 4 };
+        let recon = d[e / 256].to_f32() * (sc[e / 32] as f32) * (q as f32)
+            - dmin[e / 256].to_f32() * (mins[e / 32] as f32);
+        let tol = 1.0e-4f32 * expected.abs().max(1.0);
+        ensure!(
+            (recon - expected).abs() <= tol,
+            "elem {e}: repacked {recon} expected {expected}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "GPU SoA quantized GEMV integration: run with `cargo test gemv_q6k_soa_f16_matches_cpu -- --ignored` and a visible CUDA device"]
+fn gemv_q6k_soa_f16_matches_cpu() -> Result<()> {
+    if !cuda_available()? {
+        return Ok(());
+    }
+    let device = Device::new(0)?;
+    let stream = device.new_stream()?;
+    run_q6k_soa_case(&stream, 16, 2560, None)?;
+    run_q6k_soa_case(&stream, 8, 4096, None)?;
+    run_q6k_soa_case(&stream, 16, 9728, None)?;
+    run_q6k_soa_case(
+        &stream,
+        151_936,
+        2560,
+        Some(vec![0usize, 1, 777, 75_968, 151_935]),
+    )?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "GPU SoA quantized GEMV integration: run with `cargo test gemv_q4k_soa_f16_matches_cpu -- --ignored` and a visible CUDA device"]
+fn gemv_q4k_soa_f16_matches_cpu() -> Result<()> {
+    if !cuda_available()? {
+        return Ok(());
+    }
+    let device = Device::new(0)?;
+    let stream = device.new_stream()?;
+    run_q4k_soa_case(&stream, 16, 2560, None)?;
+    run_q4k_soa_case(&stream, 8, 4096, None)?;
+    run_q4k_soa_case(&stream, 16, 9728, None)?;
+    run_q4k_soa_case(&stream, 8, 12288, None)?;
+    run_q4k_soa_case(
+        &stream,
+        151_936,
+        2560,
+        Some(vec![0usize, 1, 777, 75_968, 151_935]),
+    )?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "GPU SoA quantized dequant integration: run with `cargo test dequant_q6k_soa_to_f16_matches_cpu -- --ignored` and a visible CUDA device"]
+fn dequant_q6k_soa_to_f16_matches_cpu() -> Result<()> {
+    if !cuda_available()? {
+        return Ok(());
+    }
+    let device = Device::new(0)?;
+    let stream = device.new_stream()?;
+    run_dequant_q6k_soa_case(&stream, 3, 2560, None)?;
+    run_dequant_q6k_soa_case(&stream, 2, 9728, None)?;
+    run_dequant_q6k_soa_case(&stream, 12_288, 4096, Some(vec![0usize, 1, 777, 12_287]))?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "GPU SoA quantized dequant integration: run with `cargo test dequant_q4k_soa_to_f16_matches_cpu -- --ignored` and a visible CUDA device"]
+fn dequant_q4k_soa_to_f16_matches_cpu() -> Result<()> {
+    if !cuda_available()? {
+        return Ok(());
+    }
+    let device = Device::new(0)?;
+    let stream = device.new_stream()?;
+    run_dequant_q4k_soa_case(&stream, 3, 2560, None)?;
+    run_dequant_q4k_soa_case(&stream, 2, 9728, None)?;
+    run_dequant_q4k_soa_case(&stream, 12_288, 4096, Some(vec![0usize, 1, 777, 12_287]))?;
+    Ok(())
+}
+
+fn run_q6k_soa_case(
+    stream: &Arc<cuda_core::Stream>,
+    rows: usize,
+    k: usize,
+    checked_rows: Option<Vec<usize>>,
+) -> Result<()> {
+    let dtype = GgmlType::Q6K;
+    let raw = make_quantized_matrix::<BlockQ6K>(dtype, rows, k, checked_rows.as_deref())?;
+    let x = make_activation(k);
+    let expected = expected_rows(dtype, &raw, rows, k, &x, checked_rows.as_deref())?;
+    let (qs, sc, d) = grout::loader::repack_q6k_soa_host(&raw, rows, k)?;
+
+    let qs_dev = to_device_2d(stream, qs, rows, k)?;
+    let sc_dev = to_device_2d(stream, sc, rows, k / 16)?;
+    let d_dev = to_device_2d(stream, d, rows, k / 256)?;
+    let x_host = Arc::new(x);
+    let x_dev = Arc::new(
+        api::copy_host_vec_to_device(&x_host)
+            .reshape(&[k])
+            .sync_on(stream)?,
+    );
+    let out = api::zeros::<f16>(&[rows]).sync_on(stream)?;
+
+    let result = unsafe {
+        gemv_q6k_soa_f16(
+            value(out.partition([8])),
+            value(qs_dev),
+            value(sc_dev),
+            value(d_dev),
+            value(x_dev),
+            value(rows as i32),
+        )
+    }
+    .generics(vec![
+        k.to_string(),
+        (k / 16).to_string(),
+        (k / 256).to_string(),
+        "1".to_string(),
+    ])
+    .sync_on(stream)?;
+    let out = result.0.unpartition();
+    let actual = out.to_host_vec().sync_on(stream)?;
+
+    for (row, expected) in expected {
+        let actual = actual[row].to_f32();
+        assert_close(row, actual, expected)?;
+    }
+    Ok(())
+}
+
+fn run_q4k_soa_case(
+    stream: &Arc<cuda_core::Stream>,
+    rows: usize,
+    k: usize,
+    checked_rows: Option<Vec<usize>>,
+) -> Result<()> {
+    let dtype = GgmlType::Q4K;
+    let raw = make_quantized_matrix::<BlockQ4K>(dtype, rows, k, checked_rows.as_deref())?;
+    let x = make_activation(k);
+    let expected = expected_rows(dtype, &raw, rows, k, &x, checked_rows.as_deref())?;
+    let (qs, sc, mins, d, dmin) = grout::loader::repack_q4k_soa_host(&raw, rows, k)?;
+
+    let qs_dev = to_device_2d(stream, qs, rows, k / 2)?;
+    let sc_dev = to_device_2d(stream, sc, rows, k / 32)?;
+    let mins_dev = to_device_2d(stream, mins, rows, k / 32)?;
+    let d_dev = to_device_2d(stream, d, rows, k / 256)?;
+    let dmin_dev = to_device_2d(stream, dmin, rows, k / 256)?;
+    let x_host = Arc::new(x);
+    let x_dev = Arc::new(
+        api::copy_host_vec_to_device(&x_host)
+            .reshape(&[k])
+            .sync_on(stream)?,
+    );
+    let out = api::zeros::<f16>(&[rows]).sync_on(stream)?;
+
+    let result = unsafe {
+        gemv_q4k_soa_f16(
+            value(out.partition([8])),
+            value(qs_dev),
+            value(sc_dev),
+            value(mins_dev),
+            value(d_dev),
+            value(dmin_dev),
+            value(x_dev),
+            value(rows as i32),
+        )
+    }
+    .generics(vec![
+        (k / 2).to_string(),
+        (k / 32).to_string(),
+        (k / 256).to_string(),
+        "1".to_string(),
+    ])
+    .sync_on(stream)?;
+    let out = result.0.unpartition();
+    let actual = out.to_host_vec().sync_on(stream)?;
+
+    for (row, expected) in expected {
+        let actual = actual[row].to_f32();
+        assert_close(row, actual, expected)?;
+    }
+    Ok(())
+}
+
+fn run_dequant_q6k_soa_case(
+    stream: &Arc<cuda_core::Stream>,
+    rows: usize,
+    k: usize,
+    checked_rows: Option<Vec<usize>>,
+) -> Result<()> {
+    let dtype = GgmlType::Q6K;
+    let tile_elems = 32usize;
+    let raw = make_quantized_matrix::<BlockQ6K>(dtype, rows, k, checked_rows.as_deref())?;
+    let (qs, sc, d) = grout::loader::repack_q6k_soa_host(&raw, rows, k)?;
+    let qs_dev = to_device_2d(stream, qs, rows, k)?;
+    let sc_dev = to_device_2d(stream, sc, rows, k / 16)?;
+    let d_dev = to_device_2d(stream, d, rows, k / 256)?;
+    let scratch_elems = scratch_elems_for(rows * k, tile_elems);
+    let scratch = api::zeros::<f16>(&[scratch_elems]).sync_on(stream)?;
+    let num_tiles = (rows * k / tile_elems) as i32;
+
+    let result = unsafe {
+        dequant_q6k_soa_to_f16(
+            value(scratch.partition([tile_elems])),
+            value(qs_dev),
+            value(sc_dev),
+            value(d_dev),
+            value(num_tiles),
+        )
+    }
+    .generics(vec![
+        k.to_string(),
+        (k / 16).to_string(),
+        (k / 256).to_string(),
+    ])
+    .sync_on(stream)?;
+    let scratch = result.0.unpartition();
+    let actual = scratch.to_host_vec().sync_on(stream)?;
+    compare_dequant_rows(dtype, &raw, rows, k, &actual, checked_rows.as_deref())?;
+    assert_scratch_tail_zero(rows * k, &actual)?;
+    Ok(())
+}
+
+fn run_dequant_q4k_soa_case(
+    stream: &Arc<cuda_core::Stream>,
+    rows: usize,
+    k: usize,
+    checked_rows: Option<Vec<usize>>,
+) -> Result<()> {
+    let dtype = GgmlType::Q4K;
+    let tile_elems = 32usize;
+    let raw = make_quantized_matrix::<BlockQ4K>(dtype, rows, k, checked_rows.as_deref())?;
+    let (qs, sc, mins, d, dmin) = grout::loader::repack_q4k_soa_host(&raw, rows, k)?;
+    let qs_dev = to_device_2d(stream, qs, rows, k / 2)?;
+    let sc_dev = to_device_2d(stream, sc, rows, k / 32)?;
+    let mins_dev = to_device_2d(stream, mins, rows, k / 32)?;
+    let d_dev = to_device_2d(stream, d, rows, k / 256)?;
+    let dmin_dev = to_device_2d(stream, dmin, rows, k / 256)?;
+    let scratch_elems = scratch_elems_for(rows * k, tile_elems);
+    let scratch = api::zeros::<f16>(&[scratch_elems]).sync_on(stream)?;
+    let num_tiles = (rows * k / tile_elems) as i32;
+
+    let result = unsafe {
+        dequant_q4k_soa_to_f16(
+            value(scratch.partition([tile_elems])),
+            value(qs_dev),
+            value(sc_dev),
+            value(mins_dev),
+            value(d_dev),
+            value(dmin_dev),
+            value(num_tiles),
+        )
+    }
+    .generics(vec![
+        (k / 2).to_string(),
+        (k / 32).to_string(),
+        (k / 256).to_string(),
+    ])
+    .sync_on(stream)?;
+    let scratch = result.0.unpartition();
+    let actual = scratch.to_host_vec().sync_on(stream)?;
+    compare_dequant_rows(dtype, &raw, rows, k, &actual, checked_rows.as_deref())?;
+    assert_scratch_tail_zero(rows * k, &actual)?;
+    Ok(())
+}
+
+fn to_device_2d<T: cutile::DType>(
+    stream: &Arc<cuda_core::Stream>,
+    host: Vec<T>,
+    rows: usize,
+    cols: usize,
+) -> Result<Arc<cutile::tensor::Tensor<T>>> {
+    let host = Arc::new(host);
+    Ok(Arc::new(
+        api::copy_host_vec_to_device(&host)
+            .reshape(&[rows, cols])
+            .sync_on(stream)?,
+    ))
+}
+

@@ -322,7 +322,7 @@ fn dequantize_q6k(data: &[u8], elem_count: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+pub(crate) fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     if j < 4 {
         let d = q[j] & 63;
         let m = q[j + 4] & 63;

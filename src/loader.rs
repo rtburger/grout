@@ -161,6 +161,7 @@ impl WeightLoader {
 }
 
 fn resident_weight_bytes_gguf(gguf: &GgufFile) -> Result<usize> {
+    let tied = !gguf.content.has_tensor("output.weight");
     let mut total = 0usize;
     for info in gguf.content.tensor_infos.values() {
         ensure!(
@@ -169,15 +170,35 @@ fn resident_weight_bytes_gguf(gguf: &GgufFile) -> Result<usize> {
             info.dtype,
             info.name
         );
+        let is_embed = info.name == "token_embd.weight";
+        let elems = info.elem_count()?;
+        // Mirrors the loader policy: Q8_0 keeps native + SoA; Q4K/Q6K keep
+        // SoA only (plus native for the embedding table, which is gathered
+        // in native layout and, when tied, also SoA as the LM head).
         let bytes = match info.dtype {
-            GgmlType::F16 | GgmlType::F32 => info
-                .elem_count()?
+            GgmlType::F16 | GgmlType::F32 => elems
                 .checked_mul(std::mem::size_of::<f16>())
                 .with_context(|| format!("resident byte size overflows for `{}`", info.name))?,
             GgmlType::Q8_0 => info.size_in_bytes()?.checked_mul(2).with_context(|| {
                 format!("Q8_0 resident byte size overflows for `{}`", info.name)
             })?,
-            GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K => info.size_in_bytes()?,
+            GgmlType::Q6K => {
+                let soa = elems + elems / 16 + elems / 256 * 2;
+                match (is_embed, tied) {
+                    (true, false) => info.size_in_bytes()?,
+                    (true, true) => info.size_in_bytes()? + soa,
+                    (false, _) => soa,
+                }
+            }
+            GgmlType::Q4K => {
+                let soa = elems / 2 + elems / 32 * 2 + elems / 256 * 4;
+                match (is_embed, tied) {
+                    (true, false) => info.size_in_bytes()?,
+                    (true, true) => info.size_in_bytes()? + soa,
+                    (false, _) => soa,
+                }
+            }
+            GgmlType::Q5K => info.size_in_bytes()?,
             other => bail!("unsupported ggml type {other} for tensor `{}`", info.name),
         };
         total = total
@@ -311,23 +332,25 @@ fn load_device_weight_gguf(
         "unsupported ggml type {} for tensor `{gguf_name}`",
         info.dtype
     );
+    // The token embedding table is read by the native-layout gather kernels.
+    // When embeddings are tied it doubles as the LM head and also needs the
+    // SoA decode layout; untied it never sees a GEMV and stays native-only.
+    let is_embed = gguf_name == "token_embd.weight";
+    let tied_embed = is_embed && !gguf.content.has_tensor("output.weight");
     match info.dtype {
         GgmlType::Q8_0 => load_device_q8_0_soa(&gguf_name, info.shape.clone(), data, stream)
             .map(MatrixWeight::single),
+        GgmlType::Q6K if !is_embed || tied_embed => {
+            load_device_q6k_soa(&gguf_name, info.shape.clone(), data, is_embed, stream)
+                .map(MatrixWeight::single)
+        }
+        GgmlType::Q4K if !is_embed || tied_embed => {
+            load_device_q4k_soa(&gguf_name, info.shape.clone(), data, is_embed, stream)
+                .map(MatrixWeight::single)
+        }
         GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K => {
-            let host_data = Arc::new(data.to_vec());
-            let device_tensor = api::copy_host_vec_to_device(&host_data)
-                .sync_on(stream)
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "copy quantized GGUF tensor `{gguf_name}` to device failed: {e:?}"
-                    )
-                })?;
-            let device_tensor = device_tensor.reshape(&[data.len()]).map_err(|e| {
-                anyhow::anyhow!("reshape quantized GGUF tensor `{gguf_name}` failed: {e:?}")
-            })?;
-            let weight =
-                Weight::quantized(info.dtype, Arc::new(device_tensor), info.shape.clone())?;
+            let device_tensor = load_native_device_bytes(&gguf_name, data, stream)?;
+            let weight = Weight::quantized(info.dtype, device_tensor, info.shape.clone())?;
             Ok(MatrixWeight::single(weight))
         }
         GgmlType::F16 | GgmlType::F32 => {
@@ -337,6 +360,192 @@ fn load_device_weight_gguf(
         }
         other => bail!("unsupported ggml type {other} for tensor `{gguf_name}`"),
     }
+}
+
+/// Host-side Q6K SoA repack for the tile-parallel decode GEMV.
+///
+/// Element decode order matches Candle's `dequantize_q6k` exactly; `qs`
+/// stores the 6-bit value minus 32 (fits i8), `sc` the native per-16-element
+/// i8 sub-scales (already element-group ordered on disk), `d` the per-block
+/// f16 super-scale.
+pub fn repack_q6k_soa_host(
+    data: &[u8],
+    rows: usize,
+    k: usize,
+) -> Result<(Vec<i8>, Vec<i8>, Vec<f16>)> {
+    ensure!(k.is_multiple_of(256), "Q6K K must be divisible by 256");
+    let blocks_per_row = k / 256;
+    let type_size = GgmlType::Q6K.type_size();
+    ensure!(
+        data.len() == rows * blocks_per_row * type_size,
+        "Q6K byte length mismatch"
+    );
+    let mut qs = vec![0i8; rows * k];
+    let mut sc = vec![0i8; rows * k / 16];
+    let mut d = vec![f16::from_f32(0.0); rows * blocks_per_row];
+    for (block_idx, block) in data.chunks_exact(type_size).enumerate() {
+        let ql = &block[0..128];
+        let qh = &block[128..192];
+        let scales = &block[192..208];
+        let d_bits = u16::from_le_bytes([block[208], block[209]]);
+        d[block_idx] = f16::from_bits(d_bits);
+        for (j, &s) in scales.iter().enumerate() {
+            sc[block_idx * 16 + j] = s as i8;
+        }
+        let out = &mut qs[block_idx * 256..(block_idx + 1) * 256];
+        for half in 0..2 {
+            let ql = &ql[64 * half..];
+            let qh = &qh[32 * half..];
+            let base = 128 * half;
+            for l in 0..32 {
+                out[base + l] = ((ql[l] & 0xF) | ((qh[l] & 3) << 4)) as i8 - 32;
+                out[base + l + 32] = ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) as i8 - 32;
+                out[base + l + 64] = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i8 - 32;
+                out[base + l + 96] = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i8 - 32;
+            }
+        }
+    }
+    Ok((qs, sc, d))
+}
+
+/// Host-side Q4K SoA repack for the tile-parallel decode GEMV.
+///
+/// `qs` is plane-packed: byte `j` of a row holds element `j` in the low
+/// nibble and element `j + k/2` in the high nibble, so the kernel unpacks
+/// with one mask and one shift and both element planes stay contiguous.
+/// `sc`/`mins` are the 6-bit sub-scales unpacked to one byte per 32-element
+/// group via the same `get_scale_min_k4` used by the CPU reference.
+pub fn repack_q4k_soa_host(
+    data: &[u8],
+    rows: usize,
+    k: usize,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<f16>, Vec<f16>)> {
+    ensure!(k.is_multiple_of(512), "Q4K K must be divisible by 512");
+    let blocks_per_row = k / 256;
+    let type_size = GgmlType::Q4K.type_size();
+    ensure!(
+        data.len() == rows * blocks_per_row * type_size,
+        "Q4K byte length mismatch"
+    );
+    let mut sc = vec![0u8; rows * k / 32];
+    let mut mins = vec![0u8; rows * k / 32];
+    let mut d = vec![f16::from_f32(0.0); rows * blocks_per_row];
+    let mut dmin = vec![f16::from_f32(0.0); rows * blocks_per_row];
+    // Element-order 4-bit values for the whole tensor, then plane-pack per row.
+    let mut vals = vec![0u8; rows * k];
+    for (block_idx, block) in data.chunks_exact(type_size).enumerate() {
+        d[block_idx] = f16::from_bits(u16::from_le_bytes([block[0], block[1]]));
+        dmin[block_idx] = f16::from_bits(u16::from_le_bytes([block[2], block[3]]));
+        let scales = &block[4..16];
+        for j in 0..8 {
+            let (s, m) = crate::dequant::get_scale_min_k4(j, scales);
+            sc[block_idx * 8 + j] = s;
+            mins[block_idx * 8 + j] = m;
+        }
+        let q = &block[16..144];
+        let out = &mut vals[block_idx * 256..(block_idx + 1) * 256];
+        for group in 0..4 {
+            let q = &q[group * 32..group * 32 + 32];
+            let base = group * 64;
+            for (l, &byte) in q.iter().enumerate() {
+                out[base + l] = byte & 0xF;
+                out[base + 32 + l] = byte >> 4;
+            }
+        }
+    }
+    let half_k = k / 2;
+    let mut qs = vec![0u8; rows * half_k];
+    for row in 0..rows {
+        let row_vals = &vals[row * k..(row + 1) * k];
+        let row_qs = &mut qs[row * half_k..(row + 1) * half_k];
+        for (j, out) in row_qs.iter_mut().enumerate() {
+            *out = row_vals[j] | (row_vals[j + half_k] << 4);
+        }
+    }
+    Ok((qs, sc, mins, d, dmin))
+}
+
+fn copy_vec_to_device_2d<T: cutile::DType>(
+    host: Vec<T>,
+    rows: usize,
+    cols: usize,
+    label: &str,
+    gguf_name: &str,
+    stream: &Arc<cuda_core::Stream>,
+) -> Result<Arc<Tensor<T>>> {
+    let host = Arc::new(host);
+    let dev = api::copy_host_vec_to_device(&host)
+        .sync_on(stream)
+        .map_err(|e| anyhow::anyhow!("copy {label} for `{gguf_name}` to device failed: {e:?}"))?
+        .reshape(&[rows, cols])
+        .map_err(|e| anyhow::anyhow!("reshape {label} for `{gguf_name}` failed: {e:?}"))?;
+    Ok(Arc::new(dev))
+}
+
+fn load_native_device_bytes(
+    gguf_name: &str,
+    data: &[u8],
+    stream: &Arc<cuda_core::Stream>,
+) -> Result<Arc<Tensor<u8>>> {
+    let host = Arc::new(data.to_vec());
+    let dev = api::copy_host_vec_to_device(&host)
+        .sync_on(stream)
+        .map_err(|e| anyhow::anyhow!("copy native `{gguf_name}` to device failed: {e:?}"))?
+        .reshape(&[data.len()])
+        .map_err(|e| anyhow::anyhow!("reshape native `{gguf_name}` failed: {e:?}"))?;
+    Ok(Arc::new(dev))
+}
+
+fn load_device_q6k_soa(
+    gguf_name: &str,
+    shape: Vec<usize>,
+    data: &[u8],
+    keep_native: bool,
+    stream: &Arc<cuda_core::Stream>,
+) -> Result<Weight> {
+    ensure!(
+        shape.len() == 2,
+        "Q6K tensor `{gguf_name}` must be rank-2, got {shape:?}"
+    );
+    let rows = shape[0];
+    let k = shape[1];
+    let (qs, sc, d) = repack_q6k_soa_host(data, rows, k)?;
+    let native = if keep_native {
+        Some(load_native_device_bytes(gguf_name, data, stream)?)
+    } else {
+        None
+    };
+    let qs = copy_vec_to_device_2d(qs, rows, k, "Q6K qs", gguf_name, stream)?;
+    let sc = copy_vec_to_device_2d(sc, rows, k / 16, "Q6K sc", gguf_name, stream)?;
+    let d = copy_vec_to_device_2d(d, rows, k / 256, "Q6K d", gguf_name, stream)?;
+    Weight::q6k_soa(native, qs, sc, d, shape)
+}
+
+fn load_device_q4k_soa(
+    gguf_name: &str,
+    shape: Vec<usize>,
+    data: &[u8],
+    keep_native: bool,
+    stream: &Arc<cuda_core::Stream>,
+) -> Result<Weight> {
+    ensure!(
+        shape.len() == 2,
+        "Q4K tensor `{gguf_name}` must be rank-2, got {shape:?}"
+    );
+    let rows = shape[0];
+    let k = shape[1];
+    let (qs, sc, mins, d, dmin) = repack_q4k_soa_host(data, rows, k)?;
+    let native = if keep_native {
+        Some(load_native_device_bytes(gguf_name, data, stream)?)
+    } else {
+        None
+    };
+    let qs = copy_vec_to_device_2d(qs, rows, k / 2, "Q4K qs", gguf_name, stream)?;
+    let sc = copy_vec_to_device_2d(sc, rows, k / 32, "Q4K sc", gguf_name, stream)?;
+    let mins = copy_vec_to_device_2d(mins, rows, k / 32, "Q4K mins", gguf_name, stream)?;
+    let d = copy_vec_to_device_2d(d, rows, k / 256, "Q4K d", gguf_name, stream)?;
+    let dmin = copy_vec_to_device_2d(dmin, rows, k / 256, "Q4K dmin", gguf_name, stream)?;
+    Weight::q4k_soa(native, qs, sc, mins, d, dmin, shape)
 }
 
 fn load_device_q8_0_soa(
