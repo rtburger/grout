@@ -279,3 +279,37 @@ Correctness gate added for this backend:
 ```bash
 cargo test gemv_q8_0_soa_f16_matches_cpu --test kernels -- --ignored --nocapture
 ```
+
+Cache residency note for the Q8_0 SoA checkpoint: the 4096 x 4096 row has a
+~17 MiB SoA working set (`qs` + scales + activation/output), and the 1024 x
+4096 row is smaller still, so both are L2-resident on the RTX 4070's 36 MiB L2.
+Treat their >500 GB/s results as cache-assisted. The larger rows — 12288 x
+4096, 4096 x 12288, and 151936 x 4096 — exceed L2 and are the DRAM-honest rows
+for this checkpoint.
+
+## Release 4B e2e wall-time note
+
+Run mode for this row: desktop/display-attached.
+
+Version block:
+
+- Driver: 595.58.03
+- CUDA toolkit: Arch `cuda` package 13.3.1-1; `/opt/cuda/bin/nvcc` CUDA 13.3, V13.3.73
+- tileiras: `/opt/cuda/bin/tileiras`, CUDA Tile IR assembler 13.3, V13.3.36
+- GPU: NVIDIA GeForce RTX 4070, 12 GB, sm_89, 46 SMs
+- Rust: `rustc 1.93.1 (01f6ddf75 2026-02-11)`
+
+Command timed with the Bash `time` keyword around the release CLI:
+
+```bash
+TIMEFORMAT='shell_wall_seconds=%R'
+time target/release/grout \
+  --model ../hf_models/qwen3_4b \
+  --prompt 'Hello, how are you?' \
+  --max-new-tokens 32 --max-ctx 512 --warmup-reps 0
+```
+
+Recorded release wall time: `shell_wall_seconds=20.782`.
+The CLI reported `prompt_tokens=18`, `generated_tokens=32`, `prompt_s=1.980`,
+`decode_s=8.121`, and `total_s=10.100`. This replaces the earlier debug-build
+wall-time observation; it is release-mode GPU execution.
