@@ -361,7 +361,6 @@ fn run_vram_preflight(
     if required_bytes > free_bytes {
         bail!("VRAM preflight failed: {summary}");
     }
-    println!("VRAM preflight PASS: {summary}");
     Ok(())
 }
 
@@ -1419,13 +1418,6 @@ impl Qwen3Engine {
         let default_max_ctx = default_max_ctx_for_config(&cfg);
         let requested_max_ctx = max_seq_len.unwrap_or(default_max_ctx);
         let max_seq_len = min(requested_max_ctx, cfg.max_position_embeddings);
-        if requested_max_ctx > cfg.max_position_embeddings {
-            eprintln!(
-                "warning: requested max context {} exceeds model context {}; capping to {}",
-                requested_max_ctx, cfg.max_position_embeddings, max_seq_len
-            );
-        }
-
         let tokenizer_path = tokenizer_json_path(model_dir, loader.is_gguf())?;
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("failed to load {}: {e}", tokenizer_path.display()))?;
@@ -2157,11 +2149,7 @@ impl Qwen3Engine {
                 Ok(runner) => {
                     self.decode_runner = Some(runner);
                 }
-                Err(err) => {
-                    eprintln!(
-                        "warning: failed to initialize CUDA decode graph ({err:#}); falling back"
-                    );
-                }
+                Err(_) => {}
             }
         };
 
@@ -2189,11 +2177,7 @@ impl Qwen3Engine {
                     let step_res = self.decode_runner.as_mut().unwrap().launch_step(cur_pos);
                     let next = match step_res {
                         Ok(tok) => tok,
-                        Err(err) => {
-                            eprintln!(
-                                "warning: CUDA decode graph launch failed at pos {} ({err:#}); falling back",
-                                cur_pos
-                            );
+                        Err(_) => {
                             graph_ok = false;
                             break;
                         }
@@ -2261,11 +2245,7 @@ impl Qwen3Engine {
                         Ok(new_logits) => {
                             logits = new_logits;
                         }
-                        Err(err) => {
-                            eprintln!(
-                                "warning: CUDA decode graph launch failed at pos {} ({err:#}); falling back",
-                                cur_pos
-                            );
+                        Err(_) => {
                             self.decode_runner = None;
                             let step_token = [next];
                             logits = self.step_seq_await(&step_token, cur_pos).await?;

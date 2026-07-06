@@ -280,7 +280,6 @@ fn config_from_gguf(gguf: &GgufFile) -> Result<Qwen3Config> {
             .metadata_required("tokenizer.ggml.eos_token_id")?
             .to_u32()?,
     };
-    println!("cfg: {cfg:#?}");
     Ok(cfg)
 }
 
