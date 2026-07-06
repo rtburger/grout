@@ -47,18 +47,7 @@ impl Weight {
     }
 
     pub fn quantized(dtype: GgmlType, data: Arc<Tensor<u8>>, shape: Vec<usize>) -> Result<Self> {
-        ensure!(
-            shape.len() == 2,
-            "quantized weight must be rank-2, got {shape:?}"
-        );
-        let elems = shape[0]
-            .checked_mul(shape[1])
-            .context("quantized weight element count overflows usize")?;
-        ensure!(
-            elems.is_multiple_of(dtype.block_size()),
-            "quantized weight shape {shape:?} has {elems} elements, not divisible by {dtype} block size {}",
-            dtype.block_size()
-        );
+        let elems = validate_quantized_shape(dtype, &shape)?;
         let expected_bytes = elems / dtype.block_size() * dtype.type_size();
         ensure!(
             data.shape() == [expected_bytes as i32],
@@ -336,4 +325,43 @@ fn tensor_shape_usize<T: cutile::DType>(tensor: &Tensor<T>) -> Result<Vec<usize>
         .iter()
         .map(|&dim| usize::try_from(dim).context("tensor shape contains negative dimension"))
         .collect()
+}
+
+fn validate_quantized_shape(dtype: GgmlType, shape: &[usize]) -> Result<usize> {
+    ensure!(
+        shape.len() == 2,
+        "quantized weight must be rank-2, got {shape:?}"
+    );
+    ensure!(
+        shape[1].is_multiple_of(dtype.block_size()),
+        "quantized weight shape {shape:?} has row width {}, not divisible by {dtype} block size {}",
+        shape[1],
+        dtype.block_size()
+    );
+    shape[0]
+        .checked_mul(shape[1])
+        .context("quantized weight element count overflows usize")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quantized_shape_rejects_blocks_that_would_straddle_rows() {
+        let shape = [2, 128];
+        assert!(
+            shape
+                .iter()
+                .product::<usize>()
+                .is_multiple_of(GgmlType::Q4K.block_size())
+        );
+        assert!(!shape[1].is_multiple_of(GgmlType::Q4K.block_size()));
+
+        let err = validate_quantized_shape(GgmlType::Q4K, &shape).unwrap_err();
+        assert!(
+            err.to_string().contains("row width 128"),
+            "unexpected error: {err:#}"
+        );
+    }
 }

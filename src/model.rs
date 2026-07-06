@@ -177,7 +177,6 @@ const KV_CACHE_DYN_CHUNK_D_DEFAULT: usize = 32;
 const DEFAULT_MAX_CTX_SMALL: usize = 32 * 1024;
 const DEFAULT_MAX_CTX_8B_CLASS: usize = 16 * 1024;
 const EIGHT_B_CLASS_HIDDEN_SIZE: usize = 4096;
-const KV_BYTES_PER_TOKEN_PREFLIGHT: usize = 144 * 1024;
 const VRAM_PREFLIGHT_SLACK_BYTES: usize = 700 * 1024 * 1024;
 
 // ── Attention tile constants — PREFILL path ────────────────────────
@@ -323,6 +322,10 @@ fn mib(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
+fn kib(bytes: usize) -> f64 {
+    bytes as f64 / 1024.0
+}
+
 fn checked_sum_bytes(parts: &[usize]) -> Result<usize> {
     parts.iter().try_fold(0usize, |acc, part| {
         acc.checked_add(*part)
@@ -333,12 +336,13 @@ fn checked_sum_bytes(parts: &[usize]) -> Result<usize> {
 fn run_vram_preflight(
     loader: &WeightLoader,
     max_ctx: usize,
+    kv_bytes_per_token: usize,
     free_bytes: usize,
     total_bytes: usize,
 ) -> Result<()> {
     let weights_bytes = loader.resident_weight_bytes()?;
     let kv_bytes = max_ctx
-        .checked_mul(KV_BYTES_PER_TOKEN_PREFLIGHT)
+        .checked_mul(kv_bytes_per_token)
         .context("VRAM preflight KV byte estimate overflows usize")?;
     let scratch_bytes = loader.prefill_dequant_scratch_bytes()?;
     let required_bytes = checked_sum_bytes(&[
@@ -348,9 +352,9 @@ fn run_vram_preflight(
         VRAM_PREFLIGHT_SLACK_BYTES,
     ])?;
     let summary = format!(
-        "max_ctx={max_ctx}: weights={:.1} MiB + KV={} tokens * 144 KiB/token = {:.1} MiB + scratch={:.1} MiB + slack={:.1} MiB => required={:.1} MiB; free={:.1} MiB / total={:.1} MiB",
+        "max_ctx={max_ctx}: weights={:.1} MiB + KV={max_ctx} tokens * {:.1} KiB/token = {:.1} MiB + scratch={:.1} MiB + slack={:.1} MiB => required={:.1} MiB; free={:.1} MiB / total={:.1} MiB",
         mib(weights_bytes),
-        max_ctx,
+        kib(kv_bytes_per_token),
         mib(kv_bytes),
         mib(scratch_bytes),
         mib(VRAM_PREFLIGHT_SLACK_BYTES),
@@ -1458,7 +1462,20 @@ impl Qwen3Engine {
         // preflight before allocating resident weights or KV caches.
         let stream = with_context(|ctx| value(ctx.get_cuda_stream().clone())).await?;
         let (free_vram, total_vram) = with_context(|ctx| value(vram_info_ctx(ctx))).await??;
-        run_vram_preflight(&loader, max_seq_len, free_vram, total_vram)?;
+        let kv_bytes_per_token = cfg
+            .num_hidden_layers
+            .checked_mul(cfg.num_key_value_heads)
+            .and_then(|bytes| bytes.checked_mul(cfg.head_dim))
+            .and_then(|bytes| bytes.checked_mul(2))
+            .and_then(|bytes| bytes.checked_mul(size_of::<f16>()))
+            .context("VRAM preflight KV bytes per token estimate overflows usize")?;
+        run_vram_preflight(
+            &loader,
+            max_seq_len,
+            kv_bytes_per_token,
+            free_vram,
+            total_vram,
+        )?;
 
         let embed_tokens = loader
             .load_device_weight("model.embed_tokens.weight", &stream)
