@@ -256,11 +256,7 @@ pub mod kernels {
         value.reshape(const_shape![])
     }
 
-    #[cutile::entry(print_ir=false,
-                       unchecked_accesses=true,
-                       optimization_hints = (
-                         sm_120 = (occupancy=1, max_divisibility=16,),
-                       ))]
+    #[cutile::entry(print_ir = false, unchecked_accesses = true)]
     unsafe fn gemv_q8_0_f16<const K: i32>(
         out: &mut Tensor<f16, { [1] }>,
         weights: &Tensor<u8, { [-1] }>,
@@ -290,11 +286,7 @@ pub mod kernels {
         out.store(acc.reshape(const_shape![1]));
     }
 
-    #[cutile::entry(print_ir=false,
-                       unchecked_accesses=true,
-                       optimization_hints = (
-                         sm_120 = (occupancy=1, max_divisibility=16,),
-                       ))]
+    #[cutile::entry(print_ir = false, unchecked_accesses = true)]
     unsafe fn gemv_q4k_f16<const K: i32>(
         out: &mut Tensor<f16, { [1] }>,
         weights: &Tensor<u8, { [-1] }>,
@@ -362,11 +354,7 @@ pub mod kernels {
         out.store(acc.reshape(const_shape![1]));
     }
 
-    #[cutile::entry(print_ir=false,
-                       unchecked_accesses=true,
-                       optimization_hints = (
-                         sm_120 = (occupancy=1, max_divisibility=16,),
-                       ))]
+    #[cutile::entry(print_ir = false, unchecked_accesses = true)]
     unsafe fn gemv_q6k_f16<const K: i32>(
         out: &mut Tensor<f16, { [1] }>,
         weights: &Tensor<u8, { [-1] }>,
@@ -437,11 +425,7 @@ pub mod kernels {
         out.store(acc.reshape(const_shape![1]));
     }
 
-    #[cutile::entry(print_ir=false,
-                       unchecked_accesses=true,
-                       optimization_hints = (
-                         sm_120 = (occupancy=1, max_divisibility=16,),
-                       ))]
+    #[cutile::entry(print_ir = false, unchecked_accesses = true)]
     unsafe fn gemv_q5k_f16<const K: i32>(
         out: &mut Tensor<f16, { [1] }>,
         weights: &Tensor<u8, { [-1] }>,
@@ -544,11 +528,7 @@ pub mod kernels {
         out.store(acc.reshape(const_shape![1]));
     }
 
-    #[cutile::entry(print_ir=false,
-                       unchecked_accesses=true,
-                       optimization_hints = (
-                         sm_120 = (occupancy=1, max_divisibility=16,),
-                       ))]
+    #[cutile::entry(print_ir = false, unchecked_accesses = true)]
     unsafe fn gemv_q8_0_f16_into<const K: i32>(
         out: &mut Tensor<f16, { [1] }>,
         weights: &Tensor<u8, { [-1] }>,
@@ -581,11 +561,7 @@ pub mod kernels {
         }
     }
 
-    #[cutile::entry(print_ir=false,
-                       unchecked_accesses=true,
-                       optimization_hints = (
-                         sm_120 = (max_divisibility=16,),
-                       ))]
+    #[cutile::entry(print_ir = false, unchecked_accesses = true)]
     unsafe fn gemv_q8_0_soa_f16<const K: i32, const KB: i32, const LATENCY: i32>(
         out: &mut Tensor<f16, { [8] }>,
         qs: &Tensor<i8, { [-1, K] }>,
@@ -646,11 +622,7 @@ pub mod kernels {
         }
     }
 
-    #[cutile::entry(print_ir=false,
-                       unchecked_accesses=true,
-                       optimization_hints = (
-                         sm_120 = (occupancy=1, max_divisibility=16,),
-                       ))]
+    #[cutile::entry(print_ir = false, unchecked_accesses = true)]
     unsafe fn gemv_q4k_f16_into<const K: i32>(
         out: &mut Tensor<f16, { [1] }>,
         weights: &Tensor<u8, { [-1] }>,
@@ -723,11 +695,7 @@ pub mod kernels {
         }
     }
 
-    #[cutile::entry(print_ir=false,
-                       unchecked_accesses=true,
-                       optimization_hints = (
-                         sm_120 = (occupancy=1, max_divisibility=16,),
-                       ))]
+    #[cutile::entry(print_ir = false, unchecked_accesses = true)]
     unsafe fn gemv_q6k_f16_into<const K: i32>(
         out: &mut Tensor<f16, { [1] }>,
         weights: &Tensor<u8, { [-1] }>,
@@ -802,11 +770,7 @@ pub mod kernels {
         }
     }
 
-    #[cutile::entry(print_ir=false,
-                       unchecked_accesses=true,
-                       optimization_hints = (
-                         sm_120 = (occupancy=1, max_divisibility=16,),
-                       ))]
+    #[cutile::entry(print_ir = false, unchecked_accesses = true)]
     unsafe fn gemv_q5k_f16_into<const K: i32>(
         out: &mut Tensor<f16, { [1] }>,
         weights: &Tensor<u8, { [-1] }>,
@@ -912,11 +876,7 @@ pub mod kernels {
         }
     }
 
-    #[cutile::entry(print_ir=false,
-                       unchecked_accesses=true,
-                       optimization_hints = (
-                         sm_120 = (occupancy=1, max_divisibility=16,),
-                       ))]
+    #[cutile::entry(print_ir = false, unchecked_accesses = true)]
     unsafe fn dequant_q8_0_to_f16(
         out: &mut Tensor<f16, { [32] }>,
         weights: &Tensor<u8, { [-1] }>,
@@ -932,11 +892,7 @@ pub mod kernels {
         }
     }
 
-    #[cutile::entry(print_ir=false,
-                       unchecked_accesses=true,
-                       optimization_hints = (
-                         sm_120 = (occupancy=1, max_divisibility=16,),
-                       ))]
+    #[cutile::entry(print_ir = false, unchecked_accesses = true)]
     unsafe fn dequant_q4k_to_f16(
         out: &mut Tensor<f16, { [32] }>,
         weights: &Tensor<u8, { [-1] }>,
@@ -976,11 +932,7 @@ pub mod kernels {
         }
     }
 
-    #[cutile::entry(print_ir=false,
-                       unchecked_accesses=true,
-                       optimization_hints = (
-                         sm_120 = (occupancy=1, max_divisibility=16,),
-                       ))]
+    #[cutile::entry(print_ir = false, unchecked_accesses = true)]
     unsafe fn dequant_q6k_to_f16(
         out: &mut Tensor<f16, { [16] }>,
         weights: &Tensor<u8, { [-1] }>,
@@ -1029,11 +981,7 @@ pub mod kernels {
         }
     }
 
-    #[cutile::entry(print_ir=false,
-                       unchecked_accesses=true,
-                       optimization_hints = (
-                         sm_120 = (occupancy=1, max_divisibility=16,),
-                       ))]
+    #[cutile::entry(print_ir = false, unchecked_accesses = true)]
     unsafe fn dequant_q5k_to_f16(
         out: &mut Tensor<f16, { [32] }>,
         weights: &Tensor<u8, { [-1] }>,
@@ -1722,11 +1670,7 @@ pub mod kernels {
         out.store(emb);
     }
 
-    #[cutile::entry(print_ir=false,
-                       unchecked_accesses=true,
-                       optimization_hints = (
-                         sm_120 = (occupancy=1, max_divisibility=16,),
-                       ))]
+    #[cutile::entry(print_ir = false, unchecked_accesses = true)]
     unsafe fn embed_gather_q8_0_f16<const D: i32>(
         token_ids: &Tensor<u32, { [-1] }>,
         weights: &Tensor<u8, { [-1] }>,
@@ -1749,11 +1693,7 @@ pub mod kernels {
         out.store(values.reshape(const_shape![1, 32]));
     }
 
-    #[cutile::entry(print_ir=false,
-                       unchecked_accesses=true,
-                       optimization_hints = (
-                         sm_120 = (occupancy=1, max_divisibility=16,),
-                       ))]
+    #[cutile::entry(print_ir = false, unchecked_accesses = true)]
     unsafe fn embed_gather_q4k_f16<const D: i32>(
         token_ids: &Tensor<u32, { [-1] }>,
         weights: &Tensor<u8, { [-1] }>,
@@ -1800,11 +1740,7 @@ pub mod kernels {
         }
     }
 
-    #[cutile::entry(print_ir=false,
-                       unchecked_accesses=true,
-                       optimization_hints = (
-                         sm_120 = (occupancy=1, max_divisibility=16,),
-                       ))]
+    #[cutile::entry(print_ir = false, unchecked_accesses = true)]
     unsafe fn embed_gather_q6k_f16<const D: i32>(
         token_ids: &Tensor<u32, { [-1] }>,
         weights: &Tensor<u8, { [-1] }>,
@@ -1860,11 +1796,7 @@ pub mod kernels {
         }
     }
 
-    #[cutile::entry(print_ir=false,
-                       unchecked_accesses=true,
-                       optimization_hints = (
-                         sm_120 = (occupancy=1, max_divisibility=16,),
-                       ))]
+    #[cutile::entry(print_ir = false, unchecked_accesses = true)]
     unsafe fn embed_gather_q5k_f16<const D: i32>(
         token_ids: &Tensor<u32, { [-1] }>,
         weights: &Tensor<u8, { [-1] }>,
