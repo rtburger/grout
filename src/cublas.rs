@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::{MaybeUninit, size_of};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 type CublasHandle = usize;
 
@@ -70,14 +70,31 @@ fn device_compute_capability(device_id: usize) -> Option<(i32, i32)> {
     }
 }
 
+/// Compute capability, queried once per device: the raw lookup is three
+/// driver calls and used to fire on every GEMM launch.
+fn cached_device_compute_capability(device_id: usize) -> Option<(i32, i32)> {
+    static CC: OnceLock<Mutex<HashMap<usize, Option<(i32, i32)>>>> = OnceLock::new();
+    let map = CC.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = map.lock().expect("device capability cache poisoned");
+    *map.entry(device_id)
+        .or_insert_with(|| device_compute_capability(device_id))
+}
+
+// GROUT_CUBLAS_* env knobs are read once per process: they fired on every
+// GEMM launch (including the decode hot loop for f16 models), and a
+// mid-process env change must not diverge from what a captured graph or an
+// earlier launch already used.
 fn selected_fast_compute_type(
     device_id: usize,
     m: i32,
     n: i32,
     k: i32,
 ) -> cublas_sys::cublasComputeType_t {
+    static COMPUTE16_ENV: OnceLock<Option<String>> = OnceLock::new();
+    static COMPUTE16_MAX_K: OnceLock<usize> = OnceLock::new();
+    static COMPUTE16_MAX_M: OnceLock<usize> = OnceLock::new();
     let default_ty = cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F;
-    let compute16_env = std::env::var("GROUT_CUBLAS_COMPUTE16").ok();
+    let compute16_env = COMPUTE16_ENV.get_or_init(|| std::env::var("GROUT_CUBLAS_COMPUTE16").ok());
     let compute16_enabled = match compute16_env.as_deref() {
         // Strict parse: only "1" forces f16 accumulation for all k (the old
         // default behavior); any other set value disables it. Previously
@@ -85,7 +102,7 @@ fn selected_fast_compute_type(
         Some("1") => true,
         Some(_) => false,
         None => {
-            let arch_prefers = match device_compute_capability(device_id) {
+            let arch_prefers = match cached_device_compute_capability(device_id) {
                 // B200/sm_100 retune, 2026-05-01:
                 // - 4B decode GEMVs prefer 32F_FAST_16F across the board.
                 // - 32B decode GEMVs mostly prefer 32F_FAST_16F, except
@@ -99,20 +116,24 @@ fn selected_fast_compute_type(
             // dequant scratch reach k ≈ 10k. Auto mode keeps compute16 for
             // short-k shapes only; force with GROUT_CUBLAS_COMPUTE16=1 or
             // retune the bound with GROUT_CUBLAS_COMPUTE16_MAX_K.
-            let max_k = std::env::var("GROUT_CUBLAS_COMPUTE16_MAX_K")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(4096);
+            let max_k = *COMPUTE16_MAX_K.get_or_init(|| {
+                std::env::var("GROUT_CUBLAS_COMPUTE16_MAX_K")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(4096)
+            });
             arch_prefers && (k as usize) <= max_k
         }
     };
     if !compute16_enabled {
         return default_ty;
     }
-    let max_m_for_f16 = std::env::var("GROUT_CUBLAS_COMPUTE16_MAX_M")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(usize::MAX);
+    let max_m_for_f16 = *COMPUTE16_MAX_M.get_or_init(|| {
+        std::env::var("GROUT_CUBLAS_COMPUTE16_MAX_M")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(usize::MAX)
+    });
     if (m as usize) <= max_m_for_f16 {
         cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_16F
     } else {
@@ -179,10 +200,11 @@ fn parse_gemm_algo(raw: &str) -> cublas_sys::cublasGemmAlgo_t {
 }
 
 fn selected_fast_algo() -> cublas_sys::cublasGemmAlgo_t {
-    let Some(raw) = std::env::var("GROUT_CUBLAS_FAST_ALGO").ok() else {
-        return cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP;
-    };
-    parse_gemm_algo(&raw)
+    static FAST_ALGO: OnceLock<cublas_sys::cublasGemmAlgo_t> = OnceLock::new();
+    *FAST_ALGO.get_or_init(|| match std::env::var("GROUT_CUBLAS_FAST_ALGO") {
+        Ok(raw) => parse_gemm_algo(&raw),
+        Err(_) => cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+    })
 }
 
 fn selected_gemm_dispatch(device_id: usize, m: i32, n: i32, k: i32) -> GemmDispatch {

@@ -421,6 +421,11 @@ struct DecodeCudaGraphRunner {
     // Vocab bound for host-side token validation before the H2D seed; the
     // in-graph embedding gather is unchecked.
     vocab_size: usize,
+    // Captured at graph build: whether the flash-decode graph (which needs
+    // the per-step s_kv upload) was recorded. Reading the env per token
+    // would cost a getenv in the hot loop and could diverge from what the
+    // captured graph actually contains.
+    flash_decode: bool,
     /// Shared alias of bufs.logits — the graph writes into it on each launch.
     logits: Arc<Tensor<f16>>,
     logits_valid: bool,
@@ -473,7 +478,7 @@ impl DecodeCudaGraphRunner {
                 self.graph.stream(),
             );
             // s_kv copy only needed when flash_decode graph is active
-            if env_bool_or("GROUT_FLASH_DECODE", false) {
+            if self.flash_decode {
                 self.s_kv_host[0] = (position_start + 1) as i32;
                 memcpy_htod_async(
                     self.s_kv_device.device_pointer().cu_deviceptr(),
@@ -3982,6 +3987,7 @@ impl Qwen3Engine {
                     position_device: position,
                     s_kv_device,
                     vocab_size: self.cfg.vocab_size,
+                    flash_decode: use_flash_decode,
                     logits: logits_alias,
                     logits_valid: !use_fused_lm_head_argmax,
                     _bufs: bufs,
@@ -5812,18 +5818,32 @@ impl Qwen3Engine {
             return Ok(());
         }
 
-        if matrix.parts().len() == 1
-            && out.shape().len() == 1
-            && out.shape()[0] as usize == matrix.rows()
-        {
-            self.quant_gemv_part_sync_on(
-                stream,
-                &matrix.parts()[0],
-                vector_f16,
-                vector_quant,
-                out,
-                label,
-            )?;
+        // Single-part fast path: write the GEMV straight into `out` when the
+        // element count matches — including the rank-2 [1, N] decode buffers,
+        // which previously failed the rank-1 check and fell through to the
+        // scratch-GEMV + D2D-copy path below.
+        let out_elems: usize = out.shape().iter().map(|d| *d as usize).product();
+        if matrix.parts().len() == 1 && out_elems == matrix.rows() {
+            if out.shape().len() == 1 {
+                self.quant_gemv_part_sync_on(
+                    stream,
+                    &matrix.parts()[0],
+                    vector_f16,
+                    vector_quant,
+                    out,
+                    label,
+                )?;
+            } else {
+                let mut out_flat = flat_alias_f16(out, matrix.rows(), label)?;
+                self.quant_gemv_part_sync_on(
+                    stream,
+                    &matrix.parts()[0],
+                    vector_f16,
+                    vector_quant,
+                    &mut out_flat,
+                    label,
+                )?;
+            }
             return Ok(());
         }
 
@@ -5870,18 +5890,32 @@ impl Qwen3Engine {
             return Ok(());
         }
 
-        if matrix.parts().len() == 1
-            && out.shape().len() == 1
-            && out.shape()[0] as usize == matrix.rows()
-        {
-            self.quant_gemv_part_record_scope(
-                s,
-                &matrix.parts()[0],
-                vector_f16,
-                vector_quant,
-                out,
-                label,
-            )?;
+        // Single-part fast path — see decode_gemv_sync_on. The [1, N] decode
+        // buffers previously fell through here, baking a scratch GEMV plus a
+        // D2D copy per layer per token into the decode graph.
+        let out_elems: usize = out.shape().iter().map(|d| *d as usize).product();
+        if matrix.parts().len() == 1 && out_elems == matrix.rows() {
+            if out.shape().len() == 1 {
+                self.quant_gemv_part_record_scope(
+                    s,
+                    &matrix.parts()[0],
+                    vector_f16,
+                    vector_quant,
+                    out,
+                    label,
+                )?;
+            } else {
+                let mut out_flat = flat_alias_f16(out, matrix.rows(), label)
+                    .map_err(|e| DeviceError::Internal(format!("{e:#}")))?;
+                self.quant_gemv_part_record_scope(
+                    s,
+                    &matrix.parts()[0],
+                    vector_f16,
+                    vector_quant,
+                    &mut out_flat,
+                    label,
+                )?;
+            }
             return Ok(());
         }
 
@@ -7300,6 +7334,18 @@ fn load_layer_matrix_weight(
 /// Concatenates multiple rank-2 weight tensors along dimension 0 (rows).
 /// F16 tensors keep the old contiguous GPU copy. Quantized tensors stay as
 /// logical row-concat parts so each raw GGUF buffer remains block-for-block.
+/// Rank-1 alias of a contiguous tensor's device memory, for GEMV kernels
+/// that require a flat output. The alias shares storage with `t`; callers
+/// must not write through both tensors concurrently.
+fn flat_alias_f16(t: &Tensor<f16>, len: usize, label: &str) -> Result<Tensor<f16>> {
+    let alias = unsafe { t.into_shared_alias() };
+    let alias = Arc::try_unwrap(alias)
+        .map_err(|_| anyhow::anyhow!("{label}: fresh alias Arc had extra refs"))?;
+    alias
+        .reshape(&[len])
+        .map_err(|e| anyhow::anyhow!("{label}: flat alias reshape failed: {e:?}"))
+}
+
 fn concat_weight_rows_2d(
     stream: &Arc<cuda_core::Stream>,
     tensors: &[&MatrixWeight],
