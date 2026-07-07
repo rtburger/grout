@@ -2687,6 +2687,23 @@ impl Qwen3Engine {
         let fmha_decode_occupancy =
             env_usize_hint_or("GROUT_FMHA_DECODE_OCCUPANCY", FMHA_DECODE_OCCUPANCY_DEFAULT);
         let use_fmha_split_kv = !use_flash_decode && env_bool_or("GROUT_FMHA_SPLIT_KV", true);
+        if use_flash_decode {
+            // The flash-decode arm sizes attn_out/lse_scratch WITHOUT the
+            // split factor but hands the kernel strided views WITH it, and
+            // never records a split-K merge: any split count > 1 writes past
+            // both buffers (unchecked) and feeds unmerged partials to o_proj.
+            // Only the single-split configuration is in-bounds and correct;
+            // reject the rest until buffers are split-sized and a merge with
+            // the kernel's [group][split] partial layout is wired in.
+            let flash_num_kv_splits = env_usize_or("GROUT_ATTN_NUM_KV_SPLITS", 2);
+            ensure!(
+                flash_num_kv_splits == 1,
+                "GROUT_FLASH_DECODE with GROUT_ATTN_NUM_KV_SPLITS={flash_num_kv_splits} is \
+                 unsupported: attn_out/lse_scratch are sized without the split factor (out-of-\
+                 bounds device writes) and split partials are never merged; set \
+                 GROUT_ATTN_NUM_KV_SPLITS=1"
+            );
+        }
         let fmha_merge_chunk_d =
             env_usize_or("GROUT_FMHA_MERGE_CHUNK_D", FMHA_MERGE_CHUNK_D_DEFAULT);
         let fmha_merge_latency =
