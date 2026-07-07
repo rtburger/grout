@@ -585,3 +585,42 @@ assistant ...") to 13.7 tok/s of coherent output, token-identical to the
 graph path under greedy — so graph-vs-sequential diagnostics are valid
 now, and a one-off capture failure can no longer masquerade as a 4x
 decode regression with corrupt text.
+
+## Hardening round (M1-M8): perf parity except an intentional prefill trade
+
+Run mode: desktop/display-attached. Version block unchanged. Grout revs:
+pre-round b475810, post-round 29a3e77 (GQA prefill Q-index fix, config/
+loader validation, RMS-norm divisibility guards, cuBLAS compute16 k-gate
++ strict env parse, cuBLAS handle lifecycle, sweep-script integrity).
+
+A/B same evening, same commands (grout_bench, greedy, --ignore-eos):
+
+| cell | b475810 | 29a3e77 | read |
+|---|---:|---:|---|
+| Q4K tg=64 decode t/s (1+2 reps) | 116.1 | 115.0 | parity (2-rep band +/-1.5) |
+| Q4K tg=128 decode t/s (3+10 reps) | 114.7 | 114.6 | parity (re-measured 3x) |
+| f16 tg=128 decode t/s (3+10 reps) | 55.2 | 55.0 | parity |
+| Q4K pp=18 prefill_ms | 218 | 221 | parity |
+| Q4K pp=1292 tg=8 e2e s | 0.421 | 0.438 | +4% e2e, intentional (below) |
+
+The pp=1292 delta is the cuBLAS compute16 k-gate: auto mode now
+accumulates in f32 (32F_FAST_16F) for k > 4096, so only down_proj
+(k=9728) switches — the exact shape where f16 accumulation (max 65504)
+risks silent overflow-to-inf over the dequant scratch. GeForce halves
+tensor throughput for f32 accumulation, costing ~9-11% of the prefill
+phase at long pp (Q4K e2e 0.424 -> 0.463 measured in isolation on one
+build). GROUT_CUBLAS_COMPUTE16=1 restores full f16 accumulation for
+sweeps that accept the risk; note the env is now parsed strictly ("1"
+enables — "false"/"off"/"no" previously ENABLED it).
+
+One measurement lesson re-confirmed: a single tg=128 10-rep reading on
+the post-round build came in at 111.9 during a back-to-back model-swap
+sequence, then re-measured 114.7/114.6/114.6 standalone — treat
+outlier cells on this display-attached box as suspect until re-run.
+
+Correctness notes for this round: GROUT_FMHA_PREFILL_GQA with GROUP <
+query_group_size (validated settings {1,2}) produced silently wrong
+prefill attention before the Q-index fix — any sweep numbers collected
+on those cells predate correct output. The GROUT_FLASH_DECODE +
+GROUT_ATTN_NUM_KV_SPLITS>1 cells were likewise invalid (H3, previous
+round).
