@@ -51,6 +51,16 @@ impl WeightLoader {
 
         let mut shard_files = HashSet::new();
         for shard in index.weight_map.values() {
+            // Shard names come from an untrusted index file and are joined
+            // onto the model dir below: reject separators/..​/absolute paths
+            // so a crafted index cannot direct opens outside the model dir.
+            ensure!(
+                !shard.is_empty()
+                    && Path::new(shard)
+                        .components()
+                        .all(|c| matches!(c, std::path::Component::Normal(_))),
+                "shard `{shard}` in model.safetensors.index.json must be a plain file name"
+            );
             shard_files.insert(shard.clone());
         }
 
@@ -301,6 +311,8 @@ fn config_from_gguf(gguf: &GgufFile) -> Result<Qwen3Config> {
             .metadata_required("tokenizer.ggml.eos_token_id")?
             .to_u32()?,
     };
+    cfg.validate()
+        .with_context(|| format!("invalid model config in GGUF {}", gguf.path().display()))?;
     Ok(cfg)
 }
 
@@ -327,6 +339,12 @@ fn load_device_weight_gguf(
     let gguf_name = map_engine_tensor_name(engine_name, &gguf.content)
         .with_context(|| format!("failed to map engine tensor `{engine_name}` to GGUF name"))?;
     let (info, data) = gguf.tensor_data(&gguf_name)?;
+    ensure!(
+        info.shape.len() == 2,
+        "matrix tensor `{gguf_name}` must be rank-2, got shape {:?} \
+         (Weight::cols indexes shape[1])",
+        info.shape
+    );
     ensure!(
         info.dtype.is_supported_for_phase1(),
         "unsupported ggml type {} for tensor `{gguf_name}`",
@@ -718,5 +736,34 @@ fn cast_to_f16(dtype: Dtype, data: &[u8]) -> Result<Vec<f16>> {
             Ok(out)
         }
         other => bail!("unsupported dtype for fp16 cast: {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M6 regression: shard names from the untrusted index must not be able
+    /// to direct file opens outside the model directory.
+    #[test]
+    fn traversal_shard_names_in_index_are_rejected() {
+        let dir = std::env::temp_dir().join(format!("grout-shard-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for shard in ["../../etc/passwd", "/etc/passwd", "a/../b"] {
+            std::fs::write(
+                dir.join("model.safetensors.index.json"),
+                format!(r#"{{"weight_map": {{"w": "{shard}"}}}}"#),
+            )
+            .unwrap();
+            let err = match WeightLoader::new(&dir) {
+                Ok(_) => panic!("shard {shard:?} was accepted"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string().contains("plain file name"),
+                "shard {shard:?} got: {err:#}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
