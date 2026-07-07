@@ -408,6 +408,9 @@ struct DecodeCudaGraphRunner {
     token_ids_device: Tensor<u32>,
     position_device: Tensor<u32>,
     s_kv_device: Tensor<i32>,
+    // Vocab bound for host-side token validation before the H2D seed; the
+    // in-graph embedding gather is unchecked.
+    vocab_size: usize,
     /// Shared alias of bufs.logits — the graph writes into it on each launch.
     logits: Arc<Tensor<f16>>,
     logits_valid: bool,
@@ -423,6 +426,11 @@ impl DecodeCudaGraphRunner {
     /// step so the graph's embedding can read the starting token; after that,
     /// the in-graph argmax writes subsequent tokens in place.
     fn seed_token(&mut self, token_id: u32) -> Result<()> {
+        ensure!(
+            (token_id as usize) < self.vocab_size,
+            "token id {token_id} out of range for vocab_size={}",
+            self.vocab_size
+        );
         self.token_host[0] = token_id;
         unsafe {
             memcpy_htod_async(
@@ -2048,6 +2056,19 @@ impl Qwen3Engine {
         self.cfg.vocab_size
     }
 
+    /// The embedding gather kernels index the weight table by raw token id
+    /// with unchecked accesses, so an out-of-range id is an out-of-bounds
+    /// device read. Every host-supplied token id must pass this check
+    /// before it reaches a kernel or the decode graph's token buffer.
+    fn ensure_token_in_vocab(&self, token: u32) -> Result<()> {
+        ensure!(
+            (token as usize) < self.cfg.vocab_size,
+            "token id {token} out of range for vocab_size={}",
+            self.cfg.vocab_size
+        );
+        Ok(())
+    }
+
     pub(crate) fn api_eos_token_ids(&self) -> &[u32] {
         &self.eos_token_ids
     }
@@ -2068,6 +2089,16 @@ impl Qwen3Engine {
             token_ids.len(),
             self.max_seq_len
         );
+        if let Some(idx) = token_ids
+            .iter()
+            .position(|&t| (t as usize) >= self.cfg.vocab_size)
+        {
+            bail!(
+                "prefill token id {} at index {idx} out of range for vocab_size={}",
+                token_ids[idx],
+                self.cfg.vocab_size
+            );
+        }
         // Mirror generate(): if a decode CUDA graph exists, prefill into its
         // KV caches (zeroed in place, pointers unchanged) so the captured
         // graph stays valid; otherwise allocate fresh layer caches.
@@ -2112,6 +2143,7 @@ impl Qwen3Engine {
             position_start,
             self.max_seq_len
         );
+        self.ensure_token_in_vocab(token)?;
         if let Some(runner) = &mut self.decode_runner
             && runner.logits_valid
         {
@@ -2134,6 +2166,7 @@ impl Qwen3Engine {
             position_start,
             self.max_seq_len
         );
+        self.ensure_token_in_vocab(token)?;
         if let Some(runner) = &mut self.decode_runner {
             runner.seed_token(token)?;
             return runner.launch_step(position_start);
@@ -2154,6 +2187,7 @@ impl Qwen3Engine {
     }
 
     pub(crate) async fn api_warmup(&mut self, token: u32) -> Result<()> {
+        self.ensure_token_in_vocab(token)?;
         self.reset_cache().await?;
         let token_ids = [token];
         let _ = self.step_seq_await(&token_ids, 0).await?;
@@ -3898,6 +3932,7 @@ impl Qwen3Engine {
                     token_ids_device: token_ids,
                     position_device: position,
                     s_kv_device,
+                    vocab_size: self.cfg.vocab_size,
                     logits: logits_alias,
                     logits_valid: !use_fused_lm_head_argmax,
                     _bufs: bufs,
