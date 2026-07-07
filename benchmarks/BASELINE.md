@@ -537,3 +537,51 @@ End-to-end after the refinement (grout_bench, 64 new tokens, greedy,
 |---|---:|---:|---|---|
 | Qwen3-4B Q4_K_M | 116.4 | 114.2 | 149.1 -> 78% | 135: at 86% |
 | Qwen3-8B Q4_K_M | 67.9 | 64.6 | 90.0 -> 75% | 84: at 81% |
+
+## Correctness fixes (KV slot-0 decode bug, silent graph fallback): perf parity
+
+Run mode: desktop/display-attached. Version block unchanged. Grout revs:
+pre-fix b475810, post-fix 4fffc7c (c8aaa3f + 4fffc7c).
+
+Two correctness fixes landed after the latency-sweep round; neither is a
+perf change, so this section records parity evidence rather than a new
+tuning result. c8aaa3f: non-graph decode (GROUT_CUDA_GRAPH_DECODE=0 or
+any capture failure) wrote every token's KV to cache slot 0 in release —
+kv_cache_update_seq_f16 ignores position_start and the only guard was a
+debug_assert. Single-token and nonzero-position host updates now route
+through kv_cache_update_seq_dynpos_f16 (the kernel the decode graph
+records), warmup covers both shapes. 4fffc7c: decode-graph capture and
+launch failures were swallowed (Err(_) => {}), silently dropping onto the
+corrupted path above; all four sites now warn on stderr and generate()
+reports the first failure via GenerationOutput::decode_graph_error.
+
+A/B at the exact conditions of the 116.4 row above (Q4_K_M, 18-token
+prompt, 64 new tokens, greedy, 1 warmup + 2 timed reps, default ctx),
+both builds re-measured back-to-back the same evening:
+
+| build | decode tok/s (mean of 2) | reps |
+|---|---:|---|
+| b475810 recorded (same day, earlier) | 116.4 | — |
+| b475810 re-measured | 113.8 | 112.5, 115.1 |
+| 4fffc7c (fixes) | 115.2 | 115.8, 114.6 |
+
+Same A/B at a longer-rep config (128 new tokens, 3 warmup + 10 timed
+reps, --max-ctx 2048), decode_phase_tps means:
+
+| model | b475810 | 4fffc7c |
+|---|---:|---:|
+| Qwen3-4B Q4_K_M | 114.8 | 114.6 |
+| Qwen3-4B f16 | 53.8 | 53.6 |
+
+Read: parity. The fixes only touch the non-graph fallback and error
+reporting; the graph decode arm is identical code. Measurement note for
+future gate readings: 2-rep desktop-mode means bounce ~ +/-1.5 tok/s
+(112.5-115.8 across one evening); the 10-rep means were stable to 0.2.
+Do not read <2% deltas from 2-rep runs as regressions.
+
+Behavior change worth recording: release GROUT_CUDA_GRAPH_DECODE=0
+decode went from 13.1 tok/s of silent garbage ("assistant assistant
+assistant ...") to 13.7 tok/s of coherent output, token-identical to the
+graph path under greedy — so graph-vs-sequential diagnostics are valid
+now, and a one-off capture failure can no longer masquerade as a 4x
+decode regression with corrupt text.
