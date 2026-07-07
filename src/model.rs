@@ -1330,6 +1330,10 @@ pub struct GenerationOutput {
     pub decode_elapsed: Duration,
     pub total_elapsed: Duration,
     pub profile_report: Option<String>,
+    /// Set when the CUDA decode graph failed to capture or launch and
+    /// generation fell back to the slower sequential step path. The
+    /// generated text is still valid; this flags the perf degradation.
+    pub decode_graph_error: Option<String>,
 }
 
 impl GenerationOutput {
@@ -2086,7 +2090,12 @@ impl Qwen3Engine {
                 Ok(runner) => {
                     self.decode_runner = Some(runner);
                 }
-                Err(_) => {}
+                Err(e) => {
+                    eprintln!(
+                        "grout: warning: decode graph capture failed; \
+                         api decode will use the sequential path: {e:#}"
+                    );
+                }
             }
         }
         logits_to_f32(logits).await
@@ -2212,6 +2221,9 @@ impl Qwen3Engine {
         }
 
         let mut cur_pos = prompt_ids.len();
+        // First decode-graph failure (capture or launch) that forced the
+        // sequential fallback; surfaced via GenerationOutput.
+        let mut decode_graph_error: Option<String> = None;
 
         // Reclaim caches from layer state and reuse cached graph, or build new.
         if self.decode_runner.is_some() {
@@ -2225,7 +2237,11 @@ impl Qwen3Engine {
                 Ok(runner) => {
                     self.decode_runner = Some(runner);
                 }
-                Err(_) => {}
+                Err(e) => {
+                    let msg = format!("decode graph capture failed: {e:#}");
+                    eprintln!("grout: warning: {msg}; falling back to sequential decode");
+                    decode_graph_error = Some(msg);
+                }
             }
         };
 
@@ -2253,7 +2269,11 @@ impl Qwen3Engine {
                     let step_res = self.decode_runner.as_mut().unwrap().launch_step(cur_pos);
                     let next = match step_res {
                         Ok(tok) => tok,
-                        Err(_) => {
+                        Err(e) => {
+                            let msg =
+                                format!("decode graph launch failed at position {cur_pos}: {e:#}");
+                            eprintln!("grout: warning: {msg}; falling back to sequential decode");
+                            decode_graph_error.get_or_insert(msg);
                             graph_ok = false;
                             break;
                         }
@@ -2321,7 +2341,11 @@ impl Qwen3Engine {
                         Ok(new_logits) => {
                             logits = new_logits;
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            let msg =
+                                format!("decode graph launch failed at position {cur_pos}: {e:#}");
+                            eprintln!("grout: warning: {msg}; falling back to sequential decode");
+                            decode_graph_error.get_or_insert(msg);
                             self.decode_runner = None;
                             let step_token = [next];
                             logits = self.step_seq_await(&step_token, cur_pos).await?;
@@ -2363,6 +2387,7 @@ impl Qwen3Engine {
             decode_elapsed,
             total_elapsed,
             profile_report,
+            decode_graph_error,
         })
     }
 
