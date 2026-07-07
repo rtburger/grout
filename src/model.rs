@@ -2716,6 +2716,13 @@ impl Qwen3Engine {
                  GROUT_ATTN_NUM_KV_SPLITS=1"
             );
         }
+        // The graph records rms_norm_f16 at RMS_BLOCK_HIDDEN directly; that
+        // kernel has no tail masking, so a non-dividing hidden size would
+        // silently drop the tail of the RMS sum (see rms_norm_arc_into_ctx).
+        ensure!(
+            d % RMS_BLOCK_HIDDEN == 0,
+            "decode graph rms_norm requires hidden_size={d} divisible by {RMS_BLOCK_HIDDEN}"
+        );
         let fmha_merge_chunk_d =
             env_usize_or("GROUT_FMHA_MERGE_CHUNK_D", FMHA_MERGE_CHUNK_D_DEFAULT);
         let fmha_merge_latency =
@@ -6417,6 +6424,16 @@ impl Qwen3Engine {
         } else {
             RMS_BLOCK
         };
+        // rms_norm_f16 tiles exactly N / BLOCK_SIZE with no tail masking: a
+        // non-dividing block size silently drops the tail from the RMS sum
+        // and leaves those output lanes unwritten (stale pool data). Reject
+        // instead — only the env override was checked before, not these
+        // fallbacks (any hidden_size % 512 != 0 model hit it silently).
+        ensure!(
+            bs <= n && n % bs == 0,
+            "rms_norm n={n} is not divisible by block size {bs}; \
+             set GROUT_RMS_HIDDEN_BLOCK to a power-of-two divisor of {n}"
+        );
         let result = unsafe {
             rms_norm_f16(
                 value(x),
