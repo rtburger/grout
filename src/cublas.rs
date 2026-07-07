@@ -6,12 +6,12 @@ use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
 use cutile::core::f16;
 use cutile::tensor::Tensor;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::{MaybeUninit, size_of};
 use std::sync::Arc;
 
 type CublasHandle = usize;
-type StreamKey = (usize, usize);
 
 #[derive(Clone, Copy)]
 struct DeviceGemmScalars {
@@ -27,9 +27,14 @@ const ALPHA_F16_VAL: f16 = f16::from_bits(0x3c00);
 const BETA_F16_VAL: f16 = f16::from_bits(0x0000);
 
 thread_local! {
-    static CUBLAS_HANDLE_CACHE: RefCell<Option<(StreamKey, CublasHandle)>> = const { RefCell::new(None) };
-    static CUBLAS_FAST_GEMM_OK: RefCell<Option<(StreamKey, bool)>> = const { RefCell::new(None) };
-    static CUBLAS_DEVICE_SCALARS: RefCell<Option<(StreamKey, DeviceGemmScalars)>> = const { RefCell::new(None) };
+    // One handle / scalar set per (thread, device), rebound to the caller's
+    // stream on every launch. Never key by stream address: streams are
+    // destroyed and their addresses reused, so a stream-keyed single-slot
+    // cache leaked one handle + scalar set per stream change and risked
+    // reusing a handle bound to a dead stream. Handles live for the thread's
+    // lifetime (bounded: one per device).
+    static CUBLAS_HANDLE_CACHE: RefCell<HashMap<usize, CublasHandle>> = RefCell::new(HashMap::new());
+    static CUBLAS_DEVICE_SCALARS: RefCell<HashMap<usize, DeviceGemmScalars>> = RefCell::new(HashMap::new());
 }
 
 #[derive(Clone, Copy)]
@@ -178,20 +183,14 @@ unsafe fn get_or_create_handle(
     device_id: usize,
     stream: cublas_sys::cudaStream_t,
 ) -> Result<cublas_sys::cublasHandle_t> {
-    let key: StreamKey = (device_id, stream as usize);
-    CUBLAS_HANDLE_CACHE.with(|cache| {
+    let handle = CUBLAS_HANDLE_CACHE.with(|cache| -> Result<CublasHandle> {
         let mut cache = cache.borrow_mut();
-        if let Some((cached_key, handle)) = *cache
-            && cached_key == key
-        {
-            return Ok(handle as cublas_sys::cublasHandle_t);
+        if let Some(handle) = cache.get(&device_id) {
+            return Ok(*handle);
         }
-
         let handle =
             cublas_result::create_handle().map_err(|e| anyhow!("cublasCreate_v2 failed: {e:?}"))?;
         unsafe {
-            cublas_result::set_stream(handle, stream)
-                .map_err(|e| anyhow!("cublasSetStream_v2 failed: {e:?}"))?;
             cublas_sys::cublasSetPointerMode_v2(
                 handle,
                 cublas_sys::cublasPointerMode_t::CUBLAS_POINTER_MODE_DEVICE,
@@ -199,9 +198,15 @@ unsafe fn get_or_create_handle(
             .result()
             .map_err(|e| anyhow!("cublasSetPointerMode_v2 failed: {e:?}"))?;
         }
-        *cache = Some((key, handle as usize));
-        Ok(handle)
-    })
+        cache.insert(device_id, handle as usize);
+        Ok(handle as usize)
+    })?;
+    let handle = handle as cublas_sys::cublasHandle_t;
+    unsafe {
+        cublas_result::set_stream(handle, stream)
+            .map_err(|e| anyhow!("cublasSetStream_v2 failed: {e:?}"))?;
+    }
+    Ok(handle)
 }
 
 unsafe fn alloc_device_scalar<T: Copy>(
@@ -228,15 +233,13 @@ unsafe fn alloc_device_scalar<T: Copy>(
 }
 
 unsafe fn get_or_create_device_scalars(
-    key: StreamKey,
+    device_id: usize,
     stream: cublas_sys::cudaStream_t,
 ) -> Result<DeviceGemmScalars> {
     CUBLAS_DEVICE_SCALARS.with(|scalars| {
         let mut scalars = scalars.borrow_mut();
-        if let Some((cached_key, existing)) = *scalars
-            && cached_key == key
-        {
-            return Ok(existing);
+        if let Some(existing) = scalars.get(&device_id) {
+            return Ok(*existing);
         }
         let created = unsafe {
             DeviceGemmScalars {
@@ -246,7 +249,16 @@ unsafe fn get_or_create_device_scalars(
                 beta_f16: alloc_device_scalar(stream, BETA_F16_VAL)?,
             }
         };
-        *scalars = Some((key, created));
+        // The constants were uploaded async on `stream`, but the cache is
+        // per-device and later GEMMs may run on a different stream: publish
+        // them with a one-time sync. (Errors loudly under graph capture,
+        // where first-time init would be invalid anyway.)
+        unsafe {
+            cu_sys::cuStreamSynchronize(stream as cu_sys::CUstream)
+                .result()
+                .map_err(|e| anyhow!("scalar publish sync failed: {e:?}"))?;
+        }
+        scalars.insert(device_id, created);
         Ok(created)
     })
 }
@@ -268,8 +280,7 @@ unsafe fn launch_gemm_f16_ptrs(
     k: i32,
 ) -> Result<()> {
     let handle = unsafe { get_or_create_handle(device_id, stream)? };
-    let key: StreamKey = (device_id, stream as usize);
-    let scalars = unsafe { get_or_create_device_scalars(key, stream)? };
+    let scalars = unsafe { get_or_create_device_scalars(device_id, stream)? };
     let run = |compute_type: cublas_sys::cublasComputeType_t,
                algo: cublas_sys::cublasGemmAlgo_t| unsafe {
         let (alpha_ptr, beta_ptr): (*const c_void, *const c_void) =
@@ -307,39 +318,16 @@ unsafe fn launch_gemm_f16_ptrs(
         )
     };
 
-    let fast_known_ok = CUBLAS_FAST_GEMM_OK.with(|m| {
-        if let Some((cached_key, ok)) = *m.borrow()
-            && cached_key == key
-        {
-            return Some(ok);
-        }
-        None
-    });
-    if fast_known_ok == Some(false) {
-        return Err(anyhow!(
-            "cublasGemmEx fast path previously failed (m={m}, n={n}, k={k}); refusing to silently fall back"
-        ));
-    }
-
+    // No sticky failure cache: one shape-specific failure (e.g. a bad
+    // GROUT_CUBLAS_FAST_ALGO override) must not brick every later GEMM of
+    // every shape. The failing call itself errors loudly with its own dims.
     let dispatch = selected_gemm_dispatch(device_id, m, n, k);
-    let fast_res = run(dispatch.compute_type, dispatch.algo);
-    match fast_res {
-        Ok(()) => {
-            CUBLAS_FAST_GEMM_OK.with(|m| {
-                *m.borrow_mut() = Some((key, true));
-            });
-            Ok(())
-        }
-        Err(e_fast) => {
-            CUBLAS_FAST_GEMM_OK.with(|m| {
-                *m.borrow_mut() = Some((key, false));
-            });
-            Err(anyhow!(
-                "cublasGemmEx fast path failed (m={m}, n={n}, k={k}, compute={:?}, err={e_fast:?})",
-                dispatch.compute_type
-            ))
-        }
-    }
+    run(dispatch.compute_type, dispatch.algo).map_err(|e_fast| {
+        anyhow!(
+            "cublasGemmEx failed (m={m}, n={n}, k={k}, compute={:?}, err={e_fast:?})",
+            dispatch.compute_type
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -358,8 +346,7 @@ unsafe fn launch_gemm_f16(
     let c_ptr = out.device_pointer().cu_deviceptr() as usize as *mut c_void;
 
     let handle = unsafe { get_or_create_handle(device_id, stream)? };
-    let key: StreamKey = (device_id, stream as usize);
-    let scalars = unsafe { get_or_create_device_scalars(key, stream)? };
+    let scalars = unsafe { get_or_create_device_scalars(device_id, stream)? };
     let run = |compute_type: cublas_sys::cublasComputeType_t,
                algo: cublas_sys::cublasGemmAlgo_t| unsafe {
         let (alpha_ptr, beta_ptr): (*const c_void, *const c_void) =
@@ -397,39 +384,16 @@ unsafe fn launch_gemm_f16(
         )
     };
 
-    let fast_known_ok = CUBLAS_FAST_GEMM_OK.with(|m| {
-        if let Some((cached_key, ok)) = *m.borrow()
-            && cached_key == key
-        {
-            return Some(ok);
-        }
-        None
-    });
-    if fast_known_ok == Some(false) {
-        return Err(anyhow!(
-            "cublasGemmEx fast path previously failed (m={m}, n={n}, k={k}); refusing to silently fall back"
-        ));
-    }
-
+    // No sticky failure cache: one shape-specific failure (e.g. a bad
+    // GROUT_CUBLAS_FAST_ALGO override) must not brick every later GEMM of
+    // every shape. The failing call itself errors loudly with its own dims.
     let dispatch = selected_gemm_dispatch(device_id, m, n, k);
-    let fast_res = run(dispatch.compute_type, dispatch.algo);
-    match fast_res {
-        Ok(()) => {
-            CUBLAS_FAST_GEMM_OK.with(|m| {
-                *m.borrow_mut() = Some((key, true));
-            });
-            Ok(())
-        }
-        Err(e_fast) => {
-            CUBLAS_FAST_GEMM_OK.with(|m| {
-                *m.borrow_mut() = Some((key, false));
-            });
-            Err(anyhow!(
-                "cublasGemmEx fast path failed (m={m}, n={n}, k={k}, compute={:?}, err={e_fast:?})",
-                dispatch.compute_type
-            ))
-        }
-    }
+    run(dispatch.compute_type, dispatch.algo).map_err(|e_fast| {
+        anyhow!(
+            "cublasGemmEx failed (m={m}, n={n}, k={k}, compute={:?}, err={e_fast:?})",
+            dispatch.compute_type
+        )
+    })
 }
 
 pub fn gemv_f16_op(
