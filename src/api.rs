@@ -129,13 +129,20 @@ impl Engine {
     }
 
     /// Clear KV state and start a new session.
-    pub fn reset(&mut self) {
+    ///
+    /// On failure the error is returned AND stashed: a caller that ignores
+    /// the Result still fails loudly on its next engine call instead of
+    /// running against a CUDA context in an undefined error state.
+    pub fn reset(&mut self) -> Result<()> {
         self.next_pos = 0;
         self.session_active = false;
         set_default_device(self.device_ord);
         if let Err(err) = self.rt.block_on(self.inner.api_reset()) {
+            let msg = format!("reset failed: {err:#}");
             self.pending_reset_error = Some(err);
+            bail!("{msg}");
         }
+        Ok(())
     }
 
     /// Return static model metadata.

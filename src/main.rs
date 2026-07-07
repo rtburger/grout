@@ -154,7 +154,10 @@ fn generate_with_api(
     let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
     ensure!(!prompt_ids.is_empty(), "prompt produced no tokens");
     ensure!(
-        prompt_ids.len() + max_new_tokens <= engine.meta().max_ctx,
+        prompt_ids
+            .len()
+            .checked_add(max_new_tokens)
+            .is_some_and(|total| total <= engine.meta().max_ctx),
         "requested total sequence length exceeds max_ctx={}",
         engine.meta().max_ctx
     );

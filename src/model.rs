@@ -210,7 +210,17 @@ fn env_usize_or(var: &str, default: usize) -> usize {
 }
 
 fn env_bool_or(var: &str, default: bool) -> bool {
-    std::env::var(var).ok().map(|v| v != "0").unwrap_or(default)
+    // Explicit true/false spellings only; unknown values fall back to the
+    // default rather than guessing. (Previously any non-"0" value counted
+    // as true, so FLAG=false / FLAG=off / FLAG=no all ENABLED the flag.)
+    let Ok(raw) = std::env::var(var) else {
+        return default;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => true,
+        "0" | "false" | "off" | "no" | "" => false,
+        _ => default,
+    }
 }
 
 fn env_usize_hint_or(var: &str, default: usize) -> Option<usize> {
@@ -2233,7 +2243,10 @@ impl Qwen3Engine {
             bail!("prompt produced no tokens");
         }
         ensure!(
-            prompt_ids.len() + max_new_tokens <= self.max_seq_len,
+            prompt_ids
+                .len()
+                .checked_add(max_new_tokens)
+                .is_some_and(|total| total <= self.max_seq_len),
             "requested total sequence length exceeds max_seq_len={}",
             self.max_seq_len
         );
@@ -7104,7 +7117,6 @@ impl Qwen3Engine {
                     // ])
 
                     // Try this instead...
-                    let m = q.shape()[0] as usize;
                     let d = self.cfg.head_dim;
                     fmha_causal(
                         value(q.clone()),
@@ -7120,7 +7132,12 @@ impl Qwen3Engine {
                         attn_bn.to_string(),
                         d.to_string(),
                         1.to_string(),
-                        ((m % attn_bn == 0) as i32).to_string(),
+                        // EVEN_K governs the KV-bounds mask, and kv_len is a
+                        // device value that grows every decode step — it can
+                        // never be statically even. The old `m % attn_bn`
+                        // (m = q_len) wrongly elided the mask whenever
+                        // GROUT_ATTN_BN_DECODE=1.
+                        "0".to_string(),
                     ])
                 };
                 let result = unsafe { result.execute(ctx)? };
