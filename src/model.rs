@@ -2204,6 +2204,18 @@ impl Qwen3Engine {
         Ok(encoding.get_ids().to_vec())
     }
 
+    /// Retire the decode-graph runner, handing its KV caches back to layer
+    /// state first. During graph decode the runner owns the caches and layer
+    /// state holds None, so dropping the runner outright would free the
+    /// session's KV mid-generation and any sequential fallback would fail
+    /// with "missing k_cache in layer state".
+    fn drop_decode_runner_lending_caches(&mut self) {
+        if let Some(runner) = &mut self.decode_runner {
+            runner.lend_kv_caches_to_layers(&mut self.layers);
+        }
+        self.decode_runner = None;
+    }
+
     pub async fn generate(
         &mut self,
         prompt: &str,
@@ -2324,7 +2336,7 @@ impl Qwen3Engine {
                     // the step-sequential path. Logits for continuation are
                     // not available (runner path discards them), so restart
                     // from the last generated token via step_seq.
-                    self.decode_runner = None;
+                    self.drop_decode_runner_lending_caches();
                     let last = *generated_ids.last().unwrap_or(&first_next);
                     let step_token = [last];
                     logits = self.step_seq_await(&step_token, cur_pos).await?;
@@ -2380,7 +2392,7 @@ impl Qwen3Engine {
                                 format!("decode graph launch failed at position {cur_pos}: {e:#}");
                             eprintln!("grout: warning: {msg}; falling back to sequential decode");
                             decode_graph_error.get_or_insert(msg);
-                            self.decode_runner = None;
+                            self.drop_decode_runner_lending_caches();
                             let step_token = [next];
                             logits = self.step_seq_await(&step_token, cur_pos).await?;
                         }
