@@ -1136,7 +1136,7 @@ fn repack_q4k_soa_reconstructs_reference() -> Result<()> {
     let rows = 3usize;
     let k = 512usize;
     let raw = make_quantized_matrix::<BlockQ4K>(GgmlType::Q4K, rows, k, None)?;
-    let (qs, sc, mins, d, dmin) = grout::loader::repack_q4k_soa_host(&raw, rows, k)?;
+    let (qs, sc, mins) = grout::loader::repack_q4k_soa_host(&raw, rows, k)?;
     let reference = dequantize_to_f32(GgmlType::Q4K, &raw, rows * k, "q4k repack")?;
     let half_k = k / 2;
     for (e, &expected) in reference.iter().enumerate() {
@@ -1144,9 +1144,9 @@ fn repack_q4k_soa_reconstructs_reference() -> Result<()> {
         let pos = e % k;
         let byte = qs[row * half_k + pos % half_k];
         let q = if pos < half_k { byte & 0xF } else { byte >> 4 };
-        let recon = d[e / 256].to_f32() * (sc[e / 32] as f32) * (q as f32)
-            - dmin[e / 256].to_f32() * (mins[e / 32] as f32);
-        let tol = 1.0e-4f32 * expected.abs().max(1.0);
+        let recon = sc[e / 32].to_f32() * (q as f32) - mins[e / 32].to_f32();
+        // Effective scales are f16-rounded products (d*sc6, dmin*m6).
+        let tol = 2.0e-3f32 * expected.abs().max(1.0);
         ensure!(
             (recon - expected).abs() <= tol,
             "elem {e}: repacked {recon} expected {expected}"
@@ -1184,9 +1184,9 @@ fn gemv_q4k_soa_f16_matches_cpu() -> Result<()> {
     let device = Device::new(0)?;
     let stream = device.new_stream()?;
     run_q4k_soa_case(&stream, 16, 2560, None)?;
-    run_q4k_soa_case(&stream, 8, 4096, None)?;
+    run_q4k_soa_case(&stream, 32, 4096, None)?;
     run_q4k_soa_case(&stream, 16, 9728, None)?;
-    run_q4k_soa_case(&stream, 8, 12288, None)?;
+    run_q4k_soa_case(&stream, 16, 12288, None)?;
     run_q4k_soa_case(
         &stream,
         151_936,
@@ -1284,13 +1284,15 @@ fn run_q4k_soa_case(
     let raw = make_quantized_matrix::<BlockQ4K>(dtype, rows, k, checked_rows.as_deref())?;
     let x = make_activation(k);
     let expected = expected_rows(dtype, &raw, rows, k, &x, checked_rows.as_deref())?;
-    let (qs, sc, mins, d, dmin) = grout::loader::repack_q4k_soa_host(&raw, rows, k)?;
+    // The effective per-32 scales are f16-rounded products (d*sc6, dmin*m6),
+    // so the achievable accuracy scales with the gross (un-cancelled) sum of
+    // |w*x|, not the net dot product. Bound: ~2^-11 of the gross magnitude.
+    let gross = gross_rows(dtype, &raw, rows, k, &x, checked_rows.as_deref())?;
+    let (qs, sc, mins) = grout::loader::repack_q4k_soa_host(&raw, rows, k)?;
 
     let qs_dev = to_device_2d(stream, qs, rows, k / 2)?;
     let sc_dev = to_device_2d(stream, sc, rows, k / 32)?;
     let mins_dev = to_device_2d(stream, mins, rows, k / 32)?;
-    let d_dev = to_device_2d(stream, d, rows, k / 256)?;
-    let dmin_dev = to_device_2d(stream, dmin, rows, k / 256)?;
     let x_host = Arc::new(x);
     let x_dev = Arc::new(
         api::copy_host_vec_to_device(&x_host)
@@ -1301,12 +1303,10 @@ fn run_q4k_soa_case(
 
     let result = unsafe {
         gemv_q4k_soa_f16(
-            value(out.partition([8])),
+            value(out.partition([16])),
             value(qs_dev),
             value(sc_dev),
             value(mins_dev),
-            value(d_dev),
-            value(dmin_dev),
             value(x_dev),
             value(rows as i32),
         )
@@ -1314,18 +1314,45 @@ fn run_q4k_soa_case(
     .generics(vec![
         (k / 2).to_string(),
         (k / 32).to_string(),
-        (k / 256).to_string(),
         "1".to_string(),
     ])
     .sync_on(stream)?;
     let out = result.0.unpartition();
     let actual = out.to_host_vec().sync_on(stream)?;
 
-    for (row, expected) in expected {
+    for ((row, expected), (_, gross)) in expected.into_iter().zip(gross) {
         let actual = actual[row].to_f32();
-        assert_close(row, actual, expected)?;
+        let tol = (1.0e-2f32 * expected.abs()).max(6.0e-4 * gross).max(1.0e-2);
+        ensure!(
+            (actual - expected).abs() <= tol,
+            "row {row}: actual {actual} expected {expected} tolerance {tol} (gross {gross})"
+        );
     }
     Ok(())
+}
+
+fn gross_rows(
+    dtype: GgmlType,
+    raw: &[u8],
+    rows: usize,
+    k: usize,
+    x: &[f16],
+    checked_rows: Option<&[usize]>,
+) -> Result<Vec<(usize, f32)>> {
+    let row_bytes = k / dtype.block_size() * dtype.type_size();
+    let rows_to_check: Vec<usize> = match checked_rows {
+        Some(rows) => rows.to_vec(),
+        None => (0..rows).collect(),
+    };
+    let x: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
+    let mut out = Vec::with_capacity(rows_to_check.len());
+    for row in rows_to_check {
+        let start = row * row_bytes;
+        let dense = dequantize_to_f32(dtype, &raw[start..start + row_bytes], k, "gross row")?;
+        let gross = dense.iter().zip(&x).map(|(w, x)| (w * x).abs()).sum::<f32>();
+        out.push((row, gross));
+    }
+    Ok(out)
 }
 
 fn run_dequant_q6k_soa_case(
@@ -1376,12 +1403,10 @@ fn run_dequant_q4k_soa_case(
     let dtype = GgmlType::Q4K;
     let tile_elems = 32usize;
     let raw = make_quantized_matrix::<BlockQ4K>(dtype, rows, k, checked_rows.as_deref())?;
-    let (qs, sc, mins, d, dmin) = grout::loader::repack_q4k_soa_host(&raw, rows, k)?;
+    let (qs, sc, mins) = grout::loader::repack_q4k_soa_host(&raw, rows, k)?;
     let qs_dev = to_device_2d(stream, qs, rows, k / 2)?;
     let sc_dev = to_device_2d(stream, sc, rows, k / 32)?;
     let mins_dev = to_device_2d(stream, mins, rows, k / 32)?;
-    let d_dev = to_device_2d(stream, d, rows, k / 256)?;
-    let dmin_dev = to_device_2d(stream, dmin, rows, k / 256)?;
     let scratch_elems = scratch_elems_for(rows * k, tile_elems);
     let scratch = api::zeros::<f16>(&[scratch_elems]).sync_on(stream)?;
     let num_tiles = (rows * k / tile_elems) as i32;
@@ -1392,15 +1417,12 @@ fn run_dequant_q4k_soa_case(
             value(qs_dev),
             value(sc_dev),
             value(mins_dev),
-            value(d_dev),
-            value(dmin_dev),
             value(num_tiles),
         )
     }
     .generics(vec![
         (k / 2).to_string(),
         (k / 32).to_string(),
-        (k / 256).to_string(),
     ])
     .sync_on(stream)?;
     let scratch = result.0.unpartition();

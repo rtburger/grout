@@ -425,3 +425,46 @@ output coherent, reps stable at 46.9/47.0. Both models remain below their
 hard gates with the gap fully attributed to Q4K SoA kernel bandwidth; at
 Q6K-class 400+ GB/s for Q4K, projected landings are ~125-130 (4B) and
 ~75-80 (8B) tok/s.
+
+## Phase 2 Q4K SoA GEMV v2 (effective scales + 16-row tiles)
+
+Run mode: desktop/display-attached. Version block unchanged (driver
+595.58.03, CUDA 13.3, tileiras 13.3, RTX 4070 sm_89).
+
+Kernel rev grounded in the sweep above: the v1 Q4K kernel moved half the
+qs bytes per tile block of its 460 GB/s Q6K sibling and issued 10 small aux
+loads per tile. v2 changes, per the cuTile performance guide (larger tiles,
+fewer loads, fused work):
+
+- Repack folds the per-256 super-scales into per-32-element effective f16
+  scales (`sc = d*sc6`, `mins = dmin*m6`), dropping d/dmin tensors: 4 aux
+  loads per tile instead of 10 and one reduction level instead of two.
+  Weight bytes 0.625 B/elem (was 0.578). Accuracy cost is f16 rounding of
+  the scale products (~2^-11 of the gross magnitude); the kernel test now
+  bounds tolerance by that gross-magnitude error model while still
+  comparing against the native-layout CPU reference.
+- 16 rows per tile block ([16,256]-byte qs loads = 4 KB, matching the Q6K
+  kernel's per-block volume); rows%16 enforced at repack (all catalog
+  model shapes qualify).
+
+Sweep (same harness, best rows): 4b_attn_q 289, 4b_ffn_gate_up 307,
+8b_ffn_gate_up 323, 8b_ffn_down_q4k 297, small k_v shapes 183-195 GB/s
+(was 126-198 across the board). Occupancy 4 retained: it wins the
+byte-dominant gate_up shapes in both models; occupancy 1 wins some others
+by smaller margins.
+
+End-to-end (grout_bench, 19-token prompt, 64 new tokens, greedy, 1 warmup
++ 2 timed reps):
+
+| model | prefill_ms | decode tok/s | prev | vs llama.cpp | gate |
+|---|---:|---:|---:|---|---|
+| Qwen3-4B Q4_K_M | 215 | 104.9 | 84.5 | 149.1 -> 70% | hard 135: below |
+| Qwen3-8B Q4_K_M | 424 | 57.8 | 46.9 | 90.0 -> 64% | hard 84: below |
+
+Remaining Q4K gap to the Q6K kernel (290 vs 460 GB/s on large shapes) and
+candidate v3: repack nibble planes per 512-element chunk instead of per
+row (byte j of chunk c = elem 512c+j | elem 512c+256+j << 4) so one
+[512]-wide x load and one sc load serve both planes, halving aux loads
+again and removing the hi-plane column offset; small k_v shapes underfill
+the grid at 64 blocks/launch and may want a row-split variant. The 4B/8B
+release coherence gates pass on this rev.

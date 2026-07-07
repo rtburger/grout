@@ -44,15 +44,14 @@ pub enum QuantizedStorage {
     },
     // Q4K SoA decode layout: qs is plane-packed nibbles (byte j of a row
     // holds element j in the low nibble and element j + k/2 in the high
-    // nibble), sc/mins the unpacked 6-bit per-32-element scales/mins, d/dmin
-    // the per-256-element f16 super-scales.
+    // nibble); sc/mins are per-32-element EFFECTIVE f16 scales with the
+    // per-256 super-scales folded in at repack time (sc = d*sc6,
+    // mins = dmin*m6), so the kernel applies one scale level.
     Q4KSoa {
         native: Option<Arc<Tensor<u8>>>,
-        qs: Arc<Tensor<u8>>,   // [rows, k/2]
-        sc: Arc<Tensor<u8>>,   // [rows, k/32]
-        mins: Arc<Tensor<u8>>, // [rows, k/32]
-        d: Arc<Tensor<f16>>,   // [rows, k/256]
-        dmin: Arc<Tensor<f16>>, // [rows, k/256]
+        qs: Arc<Tensor<u8>>,    // [rows, k/2]
+        sc: Arc<Tensor<f16>>,   // [rows, k/32]
+        mins: Arc<Tensor<f16>>, // [rows, k/32]
     },
 }
 
@@ -173,13 +172,15 @@ impl Weight {
     pub fn q4k_soa(
         native: Option<Arc<Tensor<u8>>>,
         qs: Arc<Tensor<u8>>,
-        sc: Arc<Tensor<u8>>,
-        mins: Arc<Tensor<u8>>,
-        d: Arc<Tensor<f16>>,
-        dmin: Arc<Tensor<f16>>,
+        sc: Arc<Tensor<f16>>,
+        mins: Arc<Tensor<f16>>,
         shape: Vec<usize>,
     ) -> Result<Self> {
         let (rows, k) = soa_dims(GgmlType::Q4K, &shape)?;
+        ensure!(
+            rows.is_multiple_of(16),
+            "Q4K SoA rows must be divisible by 16, got {rows}"
+        );
         if let Some(native) = &native {
             let expected = rows * (k / 256) * GgmlType::Q4K.type_size();
             ensure!(
@@ -202,22 +203,12 @@ impl Weight {
                 k / 32
             );
         }
-        for (name, t) in [("d", &d), ("dmin", &dmin)] {
-            ensure!(
-                t.shape() == [rows as i32, (k / 256) as i32],
-                "Q4K {name} shape mismatch: got {:?}, expected [{rows}, {}]",
-                t.shape(),
-                k / 256
-            );
-        }
         Ok(Self::Q4K(QuantizedWeight {
             storage: QuantizedStorage::Q4KSoa {
                 native,
                 qs,
                 sc,
                 mins,
-                d,
-                dmin,
             },
             shape,
         }))
@@ -298,25 +289,9 @@ impl QuantizedWeight {
         }
     }
 
-    #[allow(clippy::type_complexity)]
-    pub fn q4k_soa(
-        &self,
-    ) -> Option<(
-        &Arc<Tensor<u8>>,
-        &Arc<Tensor<u8>>,
-        &Arc<Tensor<u8>>,
-        &Arc<Tensor<f16>>,
-        &Arc<Tensor<f16>>,
-    )> {
+    pub fn q4k_soa(&self) -> Option<(&Arc<Tensor<u8>>, &Arc<Tensor<f16>>, &Arc<Tensor<f16>>)> {
         match &self.storage {
-            QuantizedStorage::Q4KSoa {
-                qs,
-                sc,
-                mins,
-                d,
-                dmin,
-                ..
-            } => Some((qs, sc, mins, d, dmin)),
+            QuantizedStorage::Q4KSoa { qs, sc, mins, .. } => Some((qs, sc, mins)),
             _ => None,
         }
     }
@@ -373,19 +348,15 @@ impl QuantizedWeight {
                 qs,
                 sc,
                 mins,
-                d,
-                dmin,
             } => {
                 ensure!(
                     dtype == GgmlType::Q4K,
                     "Q4K SoA storage is only valid for Q4K"
                 );
                 let native_bytes = native.as_ref().map(|t| t.size()).unwrap_or(0);
-                let soa_bytes = qs.size()
-                    + sc.size()
-                    + mins.size()
-                    + (d.size() + dmin.size()) * std::mem::size_of::<f16>();
-                let soa_expected = elems / 2 + elems / 32 * 2 + elems / 256 * 4;
+                let soa_bytes =
+                    qs.size() + (sc.size() + mins.size()) * std::mem::size_of::<f16>();
+                let soa_expected = elems / 2 + elems / 32 * 4;
                 ensure!(
                     soa_bytes == soa_expected,
                     "Q4K SoA resident bytes mismatch: got {soa_bytes}, expected {soa_expected}"

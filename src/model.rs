@@ -5294,20 +5294,18 @@ impl Qwen3Engine {
             };
             return Ok(result.0.unpartition());
         }
-        if let Some((qs, sc, mins, d, dmin)) = quant.q4k_soa() {
+        if let Some((qs, sc, mins)) = quant.q4k_soa() {
             let result = unsafe {
                 gemv_q4k_soa_f16(
-                    value(out.partition([8])),
+                    value(out.partition([16])),
                     value(qs.clone()),
                     value(sc.clone()),
                     value(mins.clone()),
-                    value(d.clone()),
-                    value(dmin.clone()),
                     value(vector.clone()),
                     value(part.rows() as i32),
                 )
                 .generics(q4k_soa_gemv_generics(part.cols()))
-                .grid(((part.rows() / 8) as u32, 1u32, 1u32))
+                .grid(((part.rows() / 16) as u32, 1u32, 1u32))
                 .compile_options(CompileOptions::default().occupancy(4))
                 .execute(ctx)?
             };
@@ -5446,21 +5444,18 @@ impl Qwen3Engine {
             };
             return Ok(());
         }
-        if let Some((qs, sc, mins, d, dmin)) = quant.q4k_soa() {
+        if let Some((qs, sc, mins)) = quant.q4k_soa() {
             unsafe {
                 dequant_q4k_soa_to_f16(
                     (&mut *scratch).partition([32]),
                     &**qs,
                     &**sc,
                     &**mins,
-                    &**d,
-                    &**dmin,
                     num_tiles as i32,
                 )
                 .generics(vec![
                     (part.cols() / 2).to_string(),
                     (part.cols() / 32).to_string(),
-                    (part.cols() / 256).to_string(),
                 ])
                 .execute(ctx)?
             };
@@ -5839,7 +5834,7 @@ impl Qwen3Engine {
                 )?;
             }
             crate::dequant::GgmlType::Q4K => {
-                let Some((qs, sc, mins, d, dmin)) = quant.q4k_soa() else {
+                let Some((qs, sc, mins)) = quant.q4k_soa() else {
                     let data = quant.native_data().ok_or_else(|| {
                         DeviceError::Internal(format!("{label}: Q4K GEMV requires native layout"))
                     })?;
@@ -5859,12 +5854,10 @@ impl Qwen3Engine {
                 s.record(
                     unsafe {
                         gemv_q4k_soa_f16(
-                            out.partition([8]),
+                            out.partition([16]),
                             &**qs,
                             &**sc,
                             &**mins,
-                            &**d,
-                            &**dmin,
                             vector,
                             part.rows() as i32,
                         )
@@ -5967,14 +5960,12 @@ impl Qwen3Engine {
                     .map_err(|e| anyhow::anyhow!("{label} q8_0 soa gemv failed: {e:?}"))?;
                 }
                 crate::dequant::GgmlType::Q4K => {
-                    if let Some((qs, sc, mins, d, dmin)) = quant.q4k_soa() {
+                    if let Some((qs, sc, mins)) = quant.q4k_soa() {
                         gemv_q4k_soa_f16(
-                            out.partition([8]),
+                            out.partition([16]),
                             &**qs,
                             &**sc,
                             &**mins,
-                            &**d,
-                            &**dmin,
                             vector,
                             part.rows() as i32,
                         )
@@ -7233,12 +7224,7 @@ fn q6k_soa_gemv_generics(k: usize) -> Vec<String> {
 }
 
 fn q4k_soa_gemv_generics(k: usize) -> Vec<String> {
-    vec![
-        (k / 2).to_string(),
-        (k / 32).to_string(),
-        (k / 256).to_string(),
-        "1".to_string(),
-    ]
+    vec![(k / 2).to_string(), (k / 32).to_string(), "1".to_string()]
 }
 
 fn max_transformer_quant_weight_elems(layers: &[Layer]) -> Option<usize> {

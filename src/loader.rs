@@ -191,7 +191,7 @@ fn resident_weight_bytes_gguf(gguf: &GgufFile) -> Result<usize> {
                 }
             }
             GgmlType::Q4K => {
-                let soa = elems / 2 + elems / 32 * 2 + elems / 256 * 4;
+                let soa = elems / 2 + elems / 32 * 4;
                 match (is_embed, tied) {
                     (true, false) => info.size_in_bytes()?,
                     (true, true) => info.size_in_bytes()? + soa,
@@ -419,7 +419,7 @@ pub fn repack_q4k_soa_host(
     data: &[u8],
     rows: usize,
     k: usize,
-) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<f16>, Vec<f16>)> {
+) -> Result<(Vec<u8>, Vec<f16>, Vec<f16>)> {
     ensure!(k.is_multiple_of(512), "Q4K K must be divisible by 512");
     let blocks_per_row = k / 256;
     let type_size = GgmlType::Q4K.type_size();
@@ -427,20 +427,18 @@ pub fn repack_q4k_soa_host(
         data.len() == rows * blocks_per_row * type_size,
         "Q4K byte length mismatch"
     );
-    let mut sc = vec![0u8; rows * k / 32];
-    let mut mins = vec![0u8; rows * k / 32];
-    let mut d = vec![f16::from_f32(0.0); rows * blocks_per_row];
-    let mut dmin = vec![f16::from_f32(0.0); rows * blocks_per_row];
+    let mut sc = vec![f16::from_f32(0.0); rows * k / 32];
+    let mut mins = vec![f16::from_f32(0.0); rows * k / 32];
     // Element-order 4-bit values for the whole tensor, then plane-pack per row.
     let mut vals = vec![0u8; rows * k];
     for (block_idx, block) in data.chunks_exact(type_size).enumerate() {
-        d[block_idx] = f16::from_bits(u16::from_le_bytes([block[0], block[1]]));
-        dmin[block_idx] = f16::from_bits(u16::from_le_bytes([block[2], block[3]]));
+        let d = f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
+        let dmin = f16::from_bits(u16::from_le_bytes([block[2], block[3]])).to_f32();
         let scales = &block[4..16];
         for j in 0..8 {
             let (s, m) = crate::dequant::get_scale_min_k4(j, scales);
-            sc[block_idx * 8 + j] = s;
-            mins[block_idx * 8 + j] = m;
+            sc[block_idx * 8 + j] = f16::from_f32(d * s as f32);
+            mins[block_idx * 8 + j] = f16::from_f32(dmin * m as f32);
         }
         let q = &block[16..144];
         let out = &mut vals[block_idx * 256..(block_idx + 1) * 256];
@@ -462,7 +460,7 @@ pub fn repack_q4k_soa_host(
             *out = row_vals[j] | (row_vals[j + half_k] << 4);
         }
     }
-    Ok((qs, sc, mins, d, dmin))
+    Ok((qs, sc, mins))
 }
 
 fn copy_vec_to_device_2d<T: cutile::DType>(
@@ -534,7 +532,7 @@ fn load_device_q4k_soa(
     );
     let rows = shape[0];
     let k = shape[1];
-    let (qs, sc, mins, d, dmin) = repack_q4k_soa_host(data, rows, k)?;
+    let (qs, sc, mins) = repack_q4k_soa_host(data, rows, k)?;
     let native = if keep_native {
         Some(load_native_device_bytes(gguf_name, data, stream)?)
     } else {
@@ -543,9 +541,7 @@ fn load_device_q4k_soa(
     let qs = copy_vec_to_device_2d(qs, rows, k / 2, "Q4K qs", gguf_name, stream)?;
     let sc = copy_vec_to_device_2d(sc, rows, k / 32, "Q4K sc", gguf_name, stream)?;
     let mins = copy_vec_to_device_2d(mins, rows, k / 32, "Q4K mins", gguf_name, stream)?;
-    let d = copy_vec_to_device_2d(d, rows, k / 256, "Q4K d", gguf_name, stream)?;
-    let dmin = copy_vec_to_device_2d(dmin, rows, k / 256, "Q4K dmin", gguf_name, stream)?;
-    Weight::q4k_soa(native, qs, sc, mins, d, dmin, shape)
+    Weight::q4k_soa(native, qs, sc, mins, shape)
 }
 
 fn load_device_q8_0_soa(

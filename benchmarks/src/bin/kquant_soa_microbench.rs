@@ -133,10 +133,9 @@ struct WeightCopy {
     qs_i8: Option<Arc<Tensor<i8>>>,
     qs_u8: Option<Arc<Tensor<u8>>>,
     sc_i8: Option<Arc<Tensor<i8>>>,
-    sc_u8: Option<Arc<Tensor<u8>>>,
-    mins_u8: Option<Arc<Tensor<u8>>>,
-    d: Arc<Tensor<f16>>,
-    dmin: Option<Arc<Tensor<f16>>>,
+    sc_f16: Option<Arc<Tensor<f16>>>,
+    mins_f16: Option<Arc<Tensor<f16>>>,
+    d: Option<Arc<Tensor<f16>>>,
 }
 
 fn main() -> Result<()> {
@@ -183,7 +182,7 @@ fn main() -> Result<()> {
 fn weight_bytes(shape: Shape) -> usize {
     let elems = shape.rows * shape.k;
     match shape.dtype {
-        Dtype::Q4K => elems / 2 + elems / 32 * 2 + elems / 256 * 4,
+        Dtype::Q4K => elems / 2 + elems / 32 * 4,
         Dtype::Q6K => elems + elems / 16 + elems / 256 * 2,
     }
 }
@@ -210,10 +209,9 @@ fn upload_copy(
                 qs_i8: Some(to_dev(stream, qs, rows, k)?),
                 qs_u8: None,
                 sc_i8: Some(to_dev(stream, sc, rows, k / 16)?),
-                sc_u8: None,
-                mins_u8: None,
-                d: to_dev(stream, d, rows, k / 256)?,
-                dmin: None,
+                sc_f16: None,
+                mins_f16: None,
+                d: Some(to_dev(stream, d, rows, k / 256)?),
             })
         }
         Dtype::Q4K => {
@@ -221,22 +219,19 @@ fn upload_copy(
             for (i, v) in qs.iter_mut().enumerate() {
                 *v = ((i + salt) % 251) as u8;
             }
-            let mut sc = vec![0u8; rows * k / 32];
-            let mut mins = vec![0u8; rows * k / 32];
+            let mut sc = vec![f16::from_f32(0.0); rows * k / 32];
+            let mut mins = vec![f16::from_f32(0.0); rows * k / 32];
             for i in 0..sc.len() {
-                sc[i] = ((i + salt) % 64) as u8;
-                mins[i] = ((i + salt * 3) % 64) as u8;
+                sc[i] = f16::from_f32(0.01 * (((i + salt) % 64) as f32));
+                mins[i] = f16::from_f32(0.001 * (((i + salt * 3) % 64) as f32));
             }
-            let d = vec![f16::from_f32(0.01); rows * k / 256];
-            let dmin = vec![f16::from_f32(0.001); rows * k / 256];
             Ok(WeightCopy {
                 qs_i8: None,
                 qs_u8: Some(to_dev(stream, qs, rows, k / 2)?),
                 sc_i8: None,
-                sc_u8: Some(to_dev(stream, sc, rows, k / 32)?),
-                mins_u8: Some(to_dev(stream, mins, rows, k / 32)?),
-                d: to_dev(stream, d, rows, k / 256)?,
-                dmin: Some(to_dev(stream, dmin, rows, k / 256)?),
+                sc_f16: Some(to_dev(stream, sc, rows, k / 32)?),
+                mins_f16: Some(to_dev(stream, mins, rows, k / 32)?),
+                d: None,
             })
         }
     }
@@ -269,16 +264,16 @@ fn launch(
 ) -> Result<Tensor<f16>> {
     let rows = shape.rows;
     let k = shape.k;
-    let grid = ((rows / 8) as u32, 1u32, 1u32);
     let opts = CompileOptions::default().occupancy(occupancy);
     match shape.dtype {
         Dtype::Q6K => {
+            let grid = ((rows / 8) as u32, 1u32, 1u32);
             let op = unsafe {
                 gemv_q6k_soa_f16(
                     value(out.partition([8])),
                     value(copy.qs_i8.clone().unwrap()),
                     value(copy.sc_i8.clone().unwrap()),
-                    value(copy.d.clone()),
+                    value(copy.d.clone().unwrap()),
                     value(activation.clone()),
                     value(rows as i32),
                 )
@@ -299,14 +294,13 @@ fn launch(
             Ok(result.0.unpartition())
         }
         Dtype::Q4K => {
+            let grid = ((rows / 16) as u32, 1u32, 1u32);
             let op = unsafe {
                 gemv_q4k_soa_f16(
-                    value(out.partition([8])),
+                    value(out.partition([16])),
                     value(copy.qs_u8.clone().unwrap()),
-                    value(copy.sc_u8.clone().unwrap()),
-                    value(copy.mins_u8.clone().unwrap()),
-                    value(copy.d.clone()),
-                    value(copy.dmin.clone().unwrap()),
+                    value(copy.sc_f16.clone().unwrap()),
+                    value(copy.mins_f16.clone().unwrap()),
                     value(activation.clone()),
                     value(rows as i32),
                 )
@@ -314,7 +308,6 @@ fn launch(
             .generics(vec![
                 (k / 2).to_string(),
                 (k / 32).to_string(),
-                (k / 256).to_string(),
                 "1".to_string(),
             ])
             .grid(grid)
@@ -337,7 +330,7 @@ fn run_shape(
     warmup_iters: usize,
     iters: usize,
 ) -> Result<()> {
-    ensure!(shape.rows.is_multiple_of(8), "rows must be divisible by 8");
+    ensure!(shape.rows.is_multiple_of(16), "rows must be divisible by 16");
     ensure!(shape.k.is_multiple_of(512), "K must be divisible by 512");
 
     let w_bytes = weight_bytes(shape);

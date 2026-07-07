@@ -706,53 +706,48 @@ pub mod kernels {
         }
     }
 
-    // Q4K SoA decode GEMV. Layout produced by `repack_q4k_soa_host`:
+    // Q4K SoA decode GEMV v2. Layout produced by `repack_q4k_soa_host`:
     // qs [rows, K/2] u8 plane-packed (byte j = elem j | elem j+K/2 << 4),
-    // sc/mins [rows, K/32] u8 unpacked 6-bit sub-scales, d/dmin [rows, K/256]
-    // f16 super-scales. Per 256-element block b with 32-element groups g:
-    // y[r] += d[b] * sum_g sc[g]*dot32(g) - dmin[b] * sum_g mins[g]*sum_x(g).
+    // sc/mins [rows, K/32] f16 per-32-element EFFECTIVE scales (per-256
+    // super-scales folded in at repack). 16 rows per tile block so each qs
+    // load moves 4 KB (same per-block volume as the 460 GB/s Q6K kernel),
+    // and one scale level means 4 aux loads per tile instead of 10.
+    // Per 32-element group g: y[r] += sc[g]*dot32(g) - mins[g]*sum_x(g).
     #[cutile::entry(print_ir = false, unchecked_accesses = true)]
-    unsafe fn gemv_q4k_soa_f16<
-        const KHALF: i32,
-        const KB32: i32,
-        const KB256: i32,
-        const LATENCY: i32,
-    >(
-        out: &mut Tensor<f16, { [8] }>,
+    unsafe fn gemv_q4k_soa_f16<const KHALF: i32, const KB32: i32, const LATENCY: i32>(
+        out: &mut Tensor<f16, { [16] }>,
         qs: &Tensor<u8, { [-1, KHALF] }>,
-        sc: &Tensor<u8, { [-1, KB32] }>,
-        mins: &Tensor<u8, { [-1, KB32] }>,
-        d: &Tensor<f16, { [-1, KB256] }>,
-        dmin: &Tensor<f16, { [-1, KB256] }>,
+        sc: &Tensor<f16, { [-1, KB32] }>,
+        mins: &Tensor<f16, { [-1, KB32] }>,
         x: &Tensor<f16, { [-1] }>,
         num_rows: i32,
     ) {
         let row_tile = get_tile_block_id().0;
-        let row_start = row_tile * 8i32;
+        let row_start = row_tile * 16i32;
         if row_start < num_rows {
-            let qs_part: Partition<u8, { [8, 256] }> = qs.partition(const_shape![8, 256]);
-            let sc_part: Partition<u8, { [8, 8] }> = sc.partition(const_shape![8, 8]);
-            let mins_part: Partition<u8, { [8, 8] }> = mins.partition(const_shape![8, 8]);
-            let d_part: Partition<f16, { [8, 1] }> = d.partition(const_shape![8, 1]);
-            let dmin_part: Partition<f16, { [8, 1] }> = dmin.partition(const_shape![8, 1]);
+            let qs_part: Partition<u8, { [16, 256] }> = qs.partition(const_shape![16, 256]);
+            let sc_part: Partition<f16, { [16, 8] }> = sc.partition(const_shape![16, 8]);
+            let mins_part: Partition<f16, { [16, 8] }> = mins.partition(const_shape![16, 8]);
             let x_part: Partition<f16, { [256] }> = x.partition(const_shape![256]);
-            let nibble_mask: Tile<u8, { [8, 256] }> = constant(0x0fu8, const_shape![8, 256]);
+            let nibble_mask: Tile<u8, { [16, 256] }> = constant(0x0fu8, const_shape![16, 256]);
+            let sixteenth: Tile<f32, { [16, 256] }> = constant(0.0625f32, const_shape![16, 256]);
             // The high-nibble plane of chunk t holds elements KHALF + 256*t,
-            // whose scale/x/super-scale tiles sit KHALF worth of columns in.
+            // whose scale/x tiles sit KHALF worth of columns in.
             let hi_off = KHALF / 256i32;
-            let mut acc: Tile<f32, { [8] }> = constant(0.0f32, const_shape![8]);
+            let mut acc: Tile<f32, { [16] }> = constant(0.0f32, const_shape![16]);
 
             for k_tile in 0i32..(KHALF / 256) {
-                let q_bytes: Tile<u8, { [8, 256] }> = qs_part.load([row_tile, k_tile]);
-                let lo_u8: Tile<u8, { [8, 256] }> = andi(q_bytes, nibble_mask);
-                let lo: Tile<f32, { [8, 256] }> = convert_tile(lo_u8);
-                // Derive the high nibble arithmetically: byte = lo + 16*hi, so
-                // hi = (byte - lo) / 16, exact in f32. (shri on rank-2 u8
-                // tiles mis-lowers in cuTile 0.2.0 — verified empirically —
-                // so avoid bit-shifts here.)
-                let all_f32: Tile<f32, { [8, 256] }> = convert_tile(q_bytes);
-                let sixteenth: Tile<f32, { [8, 256] }> = constant(0.0625f32, const_shape![8, 256]);
-                let hi: Tile<f32, { [8, 256] }> = (all_f32 - lo) * sixteenth;
+                let q_bytes: Tile<u8, { [16, 256] }> = load_view_tko(
+                    &qs_part,
+                    [row_tile, k_tile],
+                    ordering::Weak,
+                    scope::TileBlock,
+                    Some(LATENCY),
+                    tma::Enabled,
+                );
+                let all_f32: Tile<f32, { [16, 256] }> = convert_tile(q_bytes);
+                let lo_u8: Tile<u8, { [16, 256] }> = andi(q_bytes, nibble_mask);
+                let lo: Tile<f32, { [16, 256] }> = convert_tile(lo_u8);
 
                 // Low-nibble plane: elements [256*k_tile, 256*k_tile + 256).
                 let col_lo = k_tile;
@@ -765,13 +760,13 @@ pub mod kernels {
                     tma::Enabled,
                 );
                 let x_f32: Tile<f32, { [256] }> = convert_tile(x_f16);
-                let x_rows: Tile<f32, { [8, 256] }> = x_f32
+                let x_rows: Tile<f32, { [16, 256] }> = x_f32
                     .reshape(const_shape![1, 256])
-                    .broadcast(const_shape![8, 256]);
-                let prod: Tile<f32, { [8, 256] }> = lo * x_rows;
-                let prod: Tile<f32, { [8, 8, 32] }> = prod.reshape(const_shape![8, 8, 32]);
-                let dots: Tile<f32, { [8, 8] }> = reduce_sum(prod, 2i32);
-                let sc_u8: Tile<u8, { [8, 8] }> = load_view_tko(
+                    .broadcast(const_shape![16, 256]);
+                let prod: Tile<f32, { [16, 256] }> = lo * x_rows;
+                let prod: Tile<f32, { [16, 8, 32] }> = prod.reshape(const_shape![16, 8, 32]);
+                let dots: Tile<f32, { [16, 8] }> = reduce_sum(prod, 2i32);
+                let sc_f16: Tile<f16, { [16, 8] }> = load_view_tko(
                     &sc_part,
                     [row_tile, col_lo],
                     ordering::Weak,
@@ -779,14 +774,13 @@ pub mod kernels {
                     Some(LATENCY),
                     tma::Enabled,
                 );
-                let sc_f: Tile<f32, { [8, 8] }> = convert_tile(sc_u8);
-                let s1: Tile<f32, { [8] }> = reduce_sum(dots * sc_f, 1i32);
+                let sc_f: Tile<f32, { [16, 8] }> = convert_tile(sc_f16);
                 let x_groups: Tile<f32, { [8, 32] }> = x_f32.reshape(const_shape![8, 32]);
                 let sum_x: Tile<f32, { [8] }> = reduce_sum(x_groups, 1i32);
-                let sum_x: Tile<f32, { [8, 8] }> = sum_x
+                let sum_x: Tile<f32, { [16, 8] }> = sum_x
                     .reshape(const_shape![1, 8])
-                    .broadcast(const_shape![8, 8]);
-                let m_u8: Tile<u8, { [8, 8] }> = load_view_tko(
+                    .broadcast(const_shape![16, 8]);
+                let m_f16: Tile<f16, { [16, 8] }> = load_view_tko(
                     &mins_part,
                     [row_tile, col_lo],
                     ordering::Weak,
@@ -794,29 +788,14 @@ pub mod kernels {
                     Some(LATENCY),
                     tma::Enabled,
                 );
-                let m_f: Tile<f32, { [8, 8] }> = convert_tile(m_u8);
-                let s2: Tile<f32, { [8] }> = reduce_sum(m_f * sum_x, 1i32);
-                let d_f16: Tile<f16, { [8, 1] }> = load_view_tko(
-                    &d_part,
-                    [row_tile, col_lo],
-                    ordering::Weak,
-                    scope::TileBlock,
-                    Some(LATENCY),
-                    tma::Enabled,
-                );
-                let d_f: Tile<f32, { [8] }> = convert_tile(d_f16.reshape(const_shape![8]));
-                let dmin_f16: Tile<f16, { [8, 1] }> = load_view_tko(
-                    &dmin_part,
-                    [row_tile, col_lo],
-                    ordering::Weak,
-                    scope::TileBlock,
-                    Some(LATENCY),
-                    tma::Enabled,
-                );
-                let dmin_f: Tile<f32, { [8] }> = convert_tile(dmin_f16.reshape(const_shape![8]));
-                acc = acc + d_f * s1 - dmin_f * s2;
+                let m_f: Tile<f32, { [16, 8] }> = convert_tile(m_f16);
+                let contrib: Tile<f32, { [16] }> = reduce_sum(dots * sc_f - m_f * sum_x, 1i32);
+                acc = acc + contrib;
 
-                // High-nibble plane: elements [KHALF + 256*k_tile, ... + 256).
+                // High-nibble plane: derived arithmetically after the low
+                // plane is consumed (shri on rank-2 u8 tiles mis-lowers in
+                // cuTile 0.2.0; (byte - lo)/16 is exact in f32).
+                let hi: Tile<f32, { [16, 256] }> = (all_f32 - lo) * sixteenth;
                 let col_hi = hi_off + k_tile;
                 let x_f16: Tile<f16, { [256] }> = load_view_tko(
                     &x_part,
@@ -827,13 +806,13 @@ pub mod kernels {
                     tma::Enabled,
                 );
                 let x_f32: Tile<f32, { [256] }> = convert_tile(x_f16);
-                let x_rows: Tile<f32, { [8, 256] }> = x_f32
+                let x_rows: Tile<f32, { [16, 256] }> = x_f32
                     .reshape(const_shape![1, 256])
-                    .broadcast(const_shape![8, 256]);
-                let prod: Tile<f32, { [8, 256] }> = hi * x_rows;
-                let prod: Tile<f32, { [8, 8, 32] }> = prod.reshape(const_shape![8, 8, 32]);
-                let dots: Tile<f32, { [8, 8] }> = reduce_sum(prod, 2i32);
-                let sc_u8: Tile<u8, { [8, 8] }> = load_view_tko(
+                    .broadcast(const_shape![16, 256]);
+                let prod: Tile<f32, { [16, 256] }> = hi * x_rows;
+                let prod: Tile<f32, { [16, 8, 32] }> = prod.reshape(const_shape![16, 8, 32]);
+                let dots: Tile<f32, { [16, 8] }> = reduce_sum(prod, 2i32);
+                let sc_f16: Tile<f16, { [16, 8] }> = load_view_tko(
                     &sc_part,
                     [row_tile, col_hi],
                     ordering::Weak,
@@ -841,14 +820,13 @@ pub mod kernels {
                     Some(LATENCY),
                     tma::Enabled,
                 );
-                let sc_f: Tile<f32, { [8, 8] }> = convert_tile(sc_u8);
-                let s1: Tile<f32, { [8] }> = reduce_sum(dots * sc_f, 1i32);
+                let sc_f: Tile<f32, { [16, 8] }> = convert_tile(sc_f16);
                 let x_groups: Tile<f32, { [8, 32] }> = x_f32.reshape(const_shape![8, 32]);
                 let sum_x: Tile<f32, { [8] }> = reduce_sum(x_groups, 1i32);
-                let sum_x: Tile<f32, { [8, 8] }> = sum_x
+                let sum_x: Tile<f32, { [16, 8] }> = sum_x
                     .reshape(const_shape![1, 8])
-                    .broadcast(const_shape![8, 8]);
-                let m_u8: Tile<u8, { [8, 8] }> = load_view_tko(
+                    .broadcast(const_shape![16, 8]);
+                let m_f16: Tile<f16, { [16, 8] }> = load_view_tko(
                     &mins_part,
                     [row_tile, col_hi],
                     ordering::Weak,
@@ -856,30 +834,12 @@ pub mod kernels {
                     Some(LATENCY),
                     tma::Enabled,
                 );
-                let m_f: Tile<f32, { [8, 8] }> = convert_tile(m_u8);
-                let s2: Tile<f32, { [8] }> = reduce_sum(m_f * sum_x, 1i32);
-                let d_f16: Tile<f16, { [8, 1] }> = load_view_tko(
-                    &d_part,
-                    [row_tile, col_hi],
-                    ordering::Weak,
-                    scope::TileBlock,
-                    Some(LATENCY),
-                    tma::Enabled,
-                );
-                let d_f: Tile<f32, { [8] }> = convert_tile(d_f16.reshape(const_shape![8]));
-                let dmin_f16: Tile<f16, { [8, 1] }> = load_view_tko(
-                    &dmin_part,
-                    [row_tile, col_hi],
-                    ordering::Weak,
-                    scope::TileBlock,
-                    Some(LATENCY),
-                    tma::Enabled,
-                );
-                let dmin_f: Tile<f32, { [8] }> = convert_tile(dmin_f16.reshape(const_shape![8]));
-                acc = acc + d_f * s1 - dmin_f * s2;
+                let m_f: Tile<f32, { [16, 8] }> = convert_tile(m_f16);
+                let contrib: Tile<f32, { [16] }> = reduce_sum(dots * sc_f - m_f * sum_x, 1i32);
+                acc = acc + contrib;
             }
 
-            let acc: Tile<f16, { [8] }> = convert_tile(acc);
+            let acc: Tile<f16, { [16] }> = convert_tile(acc);
             out.store(acc);
         }
     }
@@ -1191,17 +1151,15 @@ pub mod kernels {
     }
 
     // Prefill dequant reading the Q4K SoA decode layout (plane-packed
-    // nibbles, unpacked per-32 sub-scales/mins, per-256 f16 super-scales)
-    // into the pooled f16 scratch. One 32-element tile per block; a tile
-    // never straddles the nibble planes because K/2 is a multiple of 32.
+    // nibbles, per-32 effective f16 scales/mins) into the pooled f16
+    // scratch. One 32-element tile per block; a tile never straddles the
+    // nibble planes because K/2 is a multiple of 32.
     #[cutile::entry(print_ir = false, unchecked_accesses = true)]
-    unsafe fn dequant_q4k_soa_to_f16<const KHALF: i32, const KB32: i32, const KB256: i32>(
+    unsafe fn dequant_q4k_soa_to_f16<const KHALF: i32, const KB32: i32>(
         out: &mut Tensor<f16, { [32] }>,
         qs: &Tensor<u8, { [-1, KHALF] }>,
-        sc: &Tensor<u8, { [-1, KB32] }>,
-        mins: &Tensor<u8, { [-1, KB32] }>,
-        d: &Tensor<f16, { [-1, KB256] }>,
-        dmin: &Tensor<f16, { [-1, KB256] }>,
+        sc: &Tensor<f16, { [-1, KB32] }>,
+        mins: &Tensor<f16, { [-1, KB32] }>,
         num_tiles: i32,
     ) {
         let tile_id = get_tile_block_id().0;
@@ -1211,37 +1169,27 @@ pub mod kernels {
             let row = tile_id / cols;
             let col_tile = tile_id - row * cols;
             let qs_part: Partition<u8, { [1, 32] }> = qs.partition(const_shape![1, 32]);
-            let sc_part: Partition<u8, { [1, 1] }> = sc.partition(const_shape![1, 1]);
-            let mins_part: Partition<u8, { [1, 1] }> = mins.partition(const_shape![1, 1]);
-            let d_part: Partition<f16, { [1, 1] }> = d.partition(const_shape![1, 1]);
-            let dmin_part: Partition<f16, { [1, 1] }> = dmin.partition(const_shape![1, 1]);
+            let sc_part: Partition<f16, { [1, 1] }> = sc.partition(const_shape![1, 1]);
+            let mins_part: Partition<f16, { [1, 1] }> = mins.partition(const_shape![1, 1]);
 
-            let sc_u8: Tile<u8, { [1, 1] }> = sc_part.load([row, col_tile]);
-            let sc_u8s: Tile<u8, { [] }> = sc_u8.reshape(const_shape![]);
-            let sc_f32: Tile<f32, { [] }> = convert_tile(sc_u8s);
+            let sc_f16: Tile<f16, { [1, 1] }> = sc_part.load([row, col_tile]);
+            let sc_f16: Tile<f16, { [] }> = sc_f16.reshape(const_shape![]);
+            let sc_f32: Tile<f32, { [] }> = convert_tile(sc_f16);
             let sc_f = splat_f32x32(sc_f32);
-            let m_u8: Tile<u8, { [1, 1] }> = mins_part.load([row, col_tile]);
-            let m_u8s: Tile<u8, { [] }> = m_u8.reshape(const_shape![]);
-            let m_f32: Tile<f32, { [] }> = convert_tile(m_u8s);
+            let m_f16: Tile<f16, { [1, 1] }> = mins_part.load([row, col_tile]);
+            let m_f16: Tile<f16, { [] }> = m_f16.reshape(const_shape![]);
+            let m_f32: Tile<f32, { [] }> = convert_tile(m_f16);
             let m_f = splat_f32x32(m_f32);
-            let d_f16: Tile<f16, { [1, 1] }> = d_part.load([row, col_tile / 8i32]);
-            let d_f16: Tile<f16, { [] }> = d_f16.reshape(const_shape![]);
-            let d_f32: Tile<f32, { [] }> = convert_tile(d_f16);
-            let d_f = splat_f32x32(d_f32);
-            let dmin_f16: Tile<f16, { [1, 1] }> = dmin_part.load([row, col_tile / 8i32]);
-            let dmin_f16: Tile<f16, { [] }> = dmin_f16.reshape(const_shape![]);
-            let dmin_f32: Tile<f32, { [] }> = convert_tile(dmin_f16);
-            let dmin_f = splat_f32x32(dmin_f32);
 
             if col_tile < half_cols {
                 let bytes: Tile<u8, { [1, 32] }> = qs_part.load([row, col_tile]);
                 let q = u8x32_mask_to_f32(bytes.reshape(const_shape![32]), 0x0fu8);
-                let values: Tile<f16, { [32] }> = convert_tile(d_f * sc_f * q - dmin_f * m_f);
+                let values: Tile<f16, { [32] }> = convert_tile(sc_f * q - m_f);
                 out.store(values);
             } else {
                 let bytes: Tile<u8, { [1, 32] }> = qs_part.load([row, col_tile - half_cols]);
                 let q = u8x32_shr_mask_to_f32(bytes.reshape(const_shape![32]), 4u8, 0x0fu8);
-                let values: Tile<f16, { [32] }> = convert_tile(d_f * sc_f * q - dmin_f * m_f);
+                let values: Tile<f16, { [32] }> = convert_tile(sc_f * q - m_f);
                 out.store(values);
             }
         }
