@@ -7331,9 +7331,6 @@ fn load_layer_matrix_weight(
         .with_context(|| format!("failed to load {human_name} ({name})"))
 }
 
-/// Concatenates multiple rank-2 weight tensors along dimension 0 (rows).
-/// F16 tensors keep the old contiguous GPU copy. Quantized tensors stay as
-/// logical row-concat parts so each raw GGUF buffer remains block-for-block.
 /// Rank-1 alias of a contiguous tensor's device memory, for GEMV kernels
 /// that require a flat output. The alias shares storage with `t`; callers
 /// must not write through both tensors concurrently.
@@ -7346,6 +7343,14 @@ fn flat_alias_f16(t: &Tensor<f16>, len: usize, label: &str) -> Result<Tensor<f16
         .map_err(|e| anyhow::anyhow!("{label}: flat alias reshape failed: {e:?}"))
 }
 
+/// Concatenates multiple rank-2 weight tensors along dimension 0 (rows).
+/// F16 tensors keep the old contiguous GPU copy. Quantized tensors stay as
+/// logical row-concat parts so each raw GGUF buffer remains block-for-block.
+///
+/// ACCEPTED RISK: sources may be backed by mmap'd model files. A file
+/// truncated or rewritten by another process between open and this read
+/// SIGBUSes (mmap TOCTOU) — inherent to mmap-based loading; accepted for
+/// local model files rather than double-buffering every weight.
 fn concat_weight_rows_2d(
     stream: &Arc<cuda_core::Stream>,
     tensors: &[&MatrixWeight],

@@ -281,6 +281,10 @@ fn parse_content(bytes: &[u8]) -> Result<Content> {
         let key = read_string(&mut reader, file_size)?;
         let value_type = ValueType::from_u32(read_u32(&mut reader)?)?;
         let value = read_value(&mut reader, value_type, 0, file_size, &mut element_budget)?;
+        // ACCEPTED RISK: duplicate keys are last-wins (matches llama.cpp's
+        // reader). A crafted file could shadow an earlier value, but every
+        // consumed key is validated downstream, so this only selects among
+        // values the file author controls anyway.
         metadata.insert(key, value);
     }
 
