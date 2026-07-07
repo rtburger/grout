@@ -7216,11 +7216,14 @@ fn concat_weight_rows_2d(
 // Measured on the 4070 (kquant_soa_microbench occupancy sweep): Q6K SoA
 // prefers occupancy 1 (small shapes 335 vs 190 GB/s at occupancy 4; large
 // shapes flat). Q4K SoA prefers occupancy 4 on the byte-dominant large
-// shapes but occupancy 1 on small-row k/v projections (251 vs 223 GB/s).
+// shapes but occupancy 1 everywhere up to 4096 rows (q 328 vs 314, k/v
+// 262-292 vs 225-236, ffn_down 337 vs 316 GB/s); only the wide gate_up
+// shapes (9728/12288 rows) prefer occupancy 4. Latency hint 1 beat 4 in
+// the sweep and stays the default.
 const Q6K_SOA_OCCUPANCY: i32 = 1;
 
 fn q4k_soa_occupancy(rows: usize) -> i32 {
-    if rows <= 1024 { 1 } else { 4 }
+    if rows <= 4096 { 1 } else { 4 }
 }
 
 fn q6k_soa_gemv_generics(k: usize) -> Vec<String> {

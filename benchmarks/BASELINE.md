@@ -506,3 +506,34 @@ arithmetic (mask, subtract, scale, cat) per byte. Candidate next steps if
 the gates demand them: LATENCY sweep on the tko loads, and an occupancy=2
 compile of the two k_v shapes; beyond that the format is near its
 arithmetic floor and gate progress likely comes from attention/glue.
+
+## Phase 2 latency sweep, occupancy refinement, and Q6K packed-6-bit rejection
+
+Run mode: desktop/display-attached. Version block unchanged.
+
+Latency sweep (`--latencies 1,4` x occupancy {1,4}, all shapes): latency 1
+wins or ties everywhere that matters; latency 4 helps only gate_up at
+occupancy 1, which occupancy 4 already matches. Latency 16 regresses
+uniformly. The default stays 1 for all kernels.
+
+Occupancy refinement from the same sweep: Q4K SoA prefers occupancy 1 on
+all shapes up to 4096 rows (attn_q 328 vs 314, k/v 262-292 vs 225-236,
+ffn_down_q4k 337 vs 316 GB/s); only the 9728/12288-row gate_up shapes
+prefer occupancy 4. Dispatch now selects by row count (<=4096 -> 1).
+
+Negative result, recorded per rule 15: a Q6K packed-6-bit v4 (chunk-local
+lo4/hi2 planes + effective f16 scales, 0.875 B/elem vs the 8-bit SoA's
+1.07) was implemented, passed all correctness tests, and was REJECTED on
+measurement: 217-326 GB/s vs the 8-bit layout's 335-464, i.e. the -18%
+bytes cost more in unpack arithmetic than it saved in traffic (lm_head
+wall time 1.06 ms vs 0.92 ms). The 8-bit Q6K SoA stands. Conclusion for
+future passes: on sm_89 this kernel family is latency/issue-bound below
+~1 byte/elem, and byte reduction below that line does not pay.
+
+End-to-end after the refinement (grout_bench, 64 new tokens, greedy,
+1 warmup + 2 timed reps); release coherence gate passes:
+
+| model | decode tok/s | v3 | vs llama.cpp | hard gate |
+|---|---:|---:|---|---|
+| Qwen3-4B Q4_K_M | 116.4 | 114.2 | 149.1 -> 78% | 135: at 86% |
+| Qwen3-8B Q4_K_M | 67.9 | 64.6 | 90.0 -> 75% | 84: at 81% |
