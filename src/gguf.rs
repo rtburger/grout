@@ -15,6 +15,13 @@ const GGUF_MAX_STRING_LENGTH: u64 = 1 << 30;
 const GGUF_MAX_ARRAY_ELEMENTS: u64 = 1 << 30;
 const GGUF_MAX_TENSOR_DIMS: u32 = 4;
 const GGUF_MAX_VALUE_DEPTH: usize = 64;
+// Cumulative cap on metadata array elements per file. Each element
+// materializes as a ~32-byte Value in RAM while costing as little as one
+// disk byte (U8), so claimed lengths must be bounded by in-memory cost,
+// not just remaining file bytes — and cumulatively, or sibling arrays
+// re-create the same amplification. 16M elements ≈ 512 MiB worst case,
+// ~30x headroom over a 152k-token tokenizer's metadata arrays.
+const GGUF_MAX_METADATA_ELEMENTS: u64 = 16 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Version {
@@ -269,10 +276,11 @@ fn parse_content(bytes: &[u8]) -> Result<Content> {
     );
 
     let mut metadata = HashMap::new();
+    let mut element_budget = GGUF_MAX_METADATA_ELEMENTS;
     for _ in 0..metadata_kv_count {
         let key = read_string(&mut reader, file_size)?;
         let value_type = ValueType::from_u32(read_u32(&mut reader)?)?;
-        let value = read_value(&mut reader, value_type, 0, file_size)?;
+        let value = read_value(&mut reader, value_type, 0, file_size, &mut element_budget)?;
         metadata.insert(key, value);
     }
 
@@ -337,6 +345,7 @@ fn read_value(
     value_type: ValueType,
     depth: usize,
     file_size: u64,
+    element_budget: &mut u64,
 ) -> Result<Value> {
     ensure!(
         depth <= GGUF_MAX_VALUE_DEPTH,
@@ -366,15 +375,30 @@ fn read_value(
                 len <= GGUF_MAX_ARRAY_ELEMENTS,
                 "GGUF array length {len} exceeds max {GGUF_MAX_ARRAY_ELEMENTS}"
             );
+            ensure!(
+                len <= *element_budget,
+                "GGUF metadata arrays exceed the total element budget \
+                 {GGUF_MAX_METADATA_ELEMENTS} (array of {len} elements, {} budget remaining)",
+                *element_budget
+            );
+            *element_budget -= len;
             let needed = len.saturating_mul(element_type.min_disk_size());
             ensure!(
                 needed <= remaining(reader, file_size)?,
                 "GGUF array of {len} elements needs at least {needed} bytes, only {} remaining",
                 remaining(reader, file_size)?
             );
-            let mut values = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+            // Grow as elements parse instead of eagerly reserving 32 bytes
+            // per claimed element off an attacker-controlled length.
+            let mut values = Vec::with_capacity(len.min(4096) as usize);
             for _ in 0..len {
-                values.push(read_value(reader, element_type, depth + 1, file_size)?);
+                values.push(read_value(
+                    reader,
+                    element_type,
+                    depth + 1,
+                    file_size,
+                    element_budget,
+                )?);
             }
             Value::Array(values)
         }
@@ -432,4 +456,85 @@ fn read_u32(reader: &mut Cursor<&[u8]>) -> Result<u32> {
 
 fn read_u64(reader: &mut Cursor<&[u8]>) -> Result<u64> {
     Ok(u64::from_le_bytes(read_exact::<8>(reader)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header(kv_count: u64) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&0x4655_4747u32.to_le_bytes()); // "GGUF"
+        b.extend_from_slice(&3u32.to_le_bytes()); // version
+        b.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        b.extend_from_slice(&kv_count.to_le_bytes());
+        b
+    }
+
+    fn push_key(b: &mut Vec<u8>, key: &str) {
+        b.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        b.extend_from_slice(key.as_bytes());
+    }
+
+    fn push_u8_array_header(b: &mut Vec<u8>, len: u64) {
+        b.extend_from_slice(&9u32.to_le_bytes()); // ValueType::Array
+        b.extend_from_slice(&0u32.to_le_bytes()); // element type U8
+        b.extend_from_slice(&len.to_le_bytes());
+    }
+
+    /// H2 regression: a claimed U8 array length within the on-disk cap but
+    /// far beyond in-memory cost must be rejected by the element budget
+    /// before any allocation — pre-fix this line reserved 32 bytes per
+    /// claimed element (32 GiB here) before reading a single element.
+    #[test]
+    fn array_len_beyond_element_budget_is_rejected_before_allocating() {
+        let mut b = header(1);
+        push_key(&mut b, "k");
+        push_u8_array_header(&mut b, 1 << 30);
+        let err = parse_content(&b).unwrap_err();
+        assert!(
+            err.to_string().contains("element budget"),
+            "got: {err:#}"
+        );
+    }
+
+    /// The budget is cumulative: sibling arrays individually under the cap
+    /// must not amplify past it together.
+    #[test]
+    fn sibling_arrays_cannot_exceed_the_budget_cumulatively() {
+        let half = GGUF_MAX_METADATA_ELEMENTS / 2 + 1;
+        let mut b = header(2);
+        push_key(&mut b, "a");
+        push_u8_array_header(&mut b, half);
+        b.resize(b.len() + half as usize, 0); // array `a` element bytes
+        push_key(&mut b, "b");
+        push_u8_array_header(&mut b, half);
+        b.resize(b.len() + half as usize, 0); // array `b` element bytes
+        let err = parse_content(&b).unwrap_err();
+        assert!(
+            err.to_string().contains("element budget"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn small_metadata_array_still_parses() {
+        let mut b = header(1);
+        push_key(&mut b, "k");
+        push_u8_array_header(&mut b, 3);
+        b.extend_from_slice(&[7u8, 8, 9]);
+        // Pad to the default alignment so the (empty) tensor-data offset
+        // check at the end of parsing passes.
+        let aligned = b.len().div_ceil(DEFAULT_ALIGNMENT as usize) * DEFAULT_ALIGNMENT as usize;
+        b.resize(aligned, 0);
+        let content = parse_content(&b).expect("valid metadata-only file must parse");
+        match content.metadata.get("k") {
+            Some(Value::Array(v)) => {
+                assert_eq!(v.len(), 3);
+                assert!(matches!(v[0], Value::U8(7)));
+                assert!(matches!(v[2], Value::U8(9)));
+            }
+            other => panic!("expected U8 array, got {other:?}"),
+        }
+    }
 }
