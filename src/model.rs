@@ -2057,8 +2057,31 @@ impl Qwen3Engine {
             token_ids.len(),
             self.max_seq_len
         );
-        self.reset_cache().await?;
+        // Mirror generate(): if a decode CUDA graph exists, prefill into its
+        // KV caches (zeroed in place, pointers unchanged) so the captured
+        // graph stays valid; otherwise allocate fresh layer caches.
+        if let Some(runner) = &mut self.decode_runner {
+            runner.zero_kv_caches()?;
+            runner.lend_kv_caches_to_layers(&mut self.layers);
+        } else {
+            self.reset_cache().await?;
+        }
         let logits = self.step_seq_await(token_ids, 0).await?;
+        if self.decode_runner.is_some() {
+            let runner = self.decode_runner.as_mut().unwrap();
+            runner.reclaim_kv_caches_from_layers(&mut self.layers)?;
+        } else if env_bool_or("GROUT_CUDA_GRAPH_DECODE", true) {
+            // First session: capture the decode graph against the KV caches
+            // prefill just populated. Failure falls back to the sequential
+            // step path in api_decode_*.
+            let stream = with_context(|ctx| value(ctx.get_cuda_stream().clone())).await?;
+            match self.build_decode_graph_scope(&stream, token_ids.len()) {
+                Ok(runner) => {
+                    self.decode_runner = Some(runner);
+                }
+                Err(_) => {}
+            }
+        }
         logits_to_f32(logits).await
     }
 
@@ -2073,6 +2096,12 @@ impl Qwen3Engine {
             position_start,
             self.max_seq_len
         );
+        if let Some(runner) = &mut self.decode_runner
+            && runner.logits_valid
+        {
+            let logits = runner.launch_step_with_logits(token, position_start)?;
+            return logits_to_f32(logits).await;
+        }
         let token_ids = [token];
         let logits = self.step_seq_await(&token_ids, position_start).await?;
         logits_to_f32(logits).await
@@ -2089,12 +2118,22 @@ impl Qwen3Engine {
             position_start,
             self.max_seq_len
         );
+        if let Some(runner) = &mut self.decode_runner {
+            runner.seed_token(token)?;
+            return runner.launch_step(position_start);
+        }
         let token_ids = [token];
         let logits = self.step_seq_await(&token_ids, position_start).await?;
         Ok(self.argmax_device(logits).await? as u32)
     }
 
     pub(crate) async fn api_reset(&mut self) -> Result<()> {
+        // With a cached decode graph the KV caches are zeroed lazily by the
+        // next prefill; allocating fresh layer caches here would only churn
+        // VRAM and then be discarded when the runner lends its own.
+        if self.decode_runner.is_some() {
+            return Ok(());
+        }
         self.reset_cache().await
     }
 
