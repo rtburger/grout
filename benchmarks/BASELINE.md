@@ -313,3 +313,66 @@ Recorded release wall time: `shell_wall_seconds=20.782`.
 The CLI reported `prompt_tokens=18`, `generated_tokens=32`, `prompt_s=1.980`,
 `decode_s=8.121`, and `total_s=10.100`. This replaces the earlier debug-build
 wall-time observation; it is release-mode GPU execution.
+
+## Phase 2 K-quant SoA tile-native decode-GEMV checkpoint
+
+Run mode for these rows: desktop/display-attached.
+
+Version block:
+
+- Driver: 595.58.03
+- CUDA toolkit: `/opt/cuda/bin/nvcc` CUDA 13.3, V13.3.73
+- tileiras: `/opt/cuda/bin/tileiras`, CUDA Tile IR assembler 13.3
+- GPU: NVIDIA GeForce RTX 4070, 12 GB, sm_89, 46 SMs
+
+Context: Q4K and Q6K decode GEMVs now run tile-parallel cuTile kernels over
+load-time SoA repacks (`gemv_q4k_soa_f16`, `gemv_q6k_soa_f16`), replacing the
+scalar-loop GGUF-native kernels in engine dispatch. Correction to the Phase 2
+Task 1 record: the 70-110 GB/s rows in "Phase 2 Task 1 standalone quantized
+GEMV microbench" measure the nvcc-compiled CUDA C reference kernels
+(256 threads/block), not the cuTile kernels the engine dispatched. The
+in-engine scalar cuTile kernels ran ~1000x slower under cuTile 0.2.0's
+block_dim=(1,1,1) launchers (measured via GROUT_PROFILE_OPS: lm_head Q6K
+MatVec 24.7 s/call, per-layer MatMuls ~184-230 ms/call, decode ~58 s/token).
+
+Layouts: Q6K = qs [N,K] i8 (6-bit value minus 32, element order) + sc
+[N,K/16] i8 + d [N,K/256] f16. Q4K = qs [N,K/2] u8 plane-packed nibbles +
+sc/mins [N,K/32] u8 + d/dmin [N,K/256] f16. Native block bytes are no longer
+resident for transformer projections (prefill dequants from SoA); the token
+embedding keeps native bytes for the gather path, plus SoA when tied.
+Known cuTile 0.2.0 issue found during this pass: `shri` on rank-2 u8 tiles
+silently mis-lowers (no shift applied); the Q4K kernel derives the high
+nibble arithmetically ((byte - lo) / 16) instead.
+
+End-to-end Qwen3-4B Q4_K_M, prompt "Write one paragraph about compiler
+design." (19 tokens), 64 new tokens, greedy, release build:
+
+| path | prefill | decode tok/s | notes |
+|---|---:|---:|---|
+| generate() decode graph (`grout_bench`, 1 warmup + 2 timed reps) | 235 ms | 80.8 | reps stable 80.7/80.9 |
+| frozen API (`grout` CLI, Engine::prefill/decode_greedy) | 255 ms | 78.0 | after api_* wired to the decode graph |
+| pre-SoA reference (same binary layout, either path) | 25.2-29.0 s | 0.017-0.022 | ~58 s/token |
+
+Through pi-rs (`pi-ai-grout`, branch grout-lib-api-integration, print mode,
+1244-token system prompt, sampling on): prefill 230 tok/s (first session,
+includes one-time decode-graph capture), decode 59.6 tok/s over 373 generated
+tokens. Before this pass the same invocation measured 2.11 tok/s decode.
+
+Correctness gates for the new kernels:
+
+```bash
+cargo test repack_q6k_soa_reconstructs_reference repack_q4k_soa_reconstructs_reference
+cargo test --test kernels gemv_q6k_soa_f16_matches_cpu -- --ignored
+cargo test --test kernels gemv_q4k_soa_f16_matches_cpu -- --ignored
+cargo test --test kernels dequant_q6k_soa_to_f16_matches_cpu -- --ignored
+cargo test --test kernels dequant_q4k_soa_to_f16_matches_cpu -- --ignored
+```
+
+Full ignored kernel suite: 19 passed / 0 failed on the version block above.
+
+Gate accounting against AGENTS #11 (4B hard gate >=135 tok/s): decode lands
+at 80.8 tok/s, below the hard gate. Per AGENTS #12 the next diagnostic is a
+standalone GB/s microbench for gemv_q4k_soa_f16/gemv_q6k_soa_f16 at the exact
+4B/8B shapes with an occupancy sweep (as done for Q8_0 SoA) before any kernel
+churn; that microbench is not yet written and the occupancy=4 dispatch value
+is inherited from the Q8_0 sweep, not measured for these kernels.
