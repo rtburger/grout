@@ -410,9 +410,10 @@ pub fn repack_q6k_soa_host(
 
 /// Host-side Q4K SoA repack for the tile-parallel decode GEMV.
 ///
-/// `qs` is plane-packed: byte `j` of a row holds element `j` in the low
-/// nibble and element `j + k/2` in the high nibble, so the kernel unpacks
-/// with one mask and one shift and both element planes stay contiguous.
+/// `qs` is plane-packed per 512-element chunk: byte `j` (0..256) of chunk
+/// `c` holds element `512c + j` in the low nibble and element `512c + 256 + j`
+/// in the high nibble, so one activation/scale load serves both nibble
+/// planes of a chunk and all kernel column indices stay contiguous.
 /// `sc`/`mins` are the 6-bit sub-scales unpacked to one byte per 32-element
 /// group via the same `get_scale_min_k4` used by the CPU reference.
 pub fn repack_q4k_soa_host(
@@ -456,8 +457,12 @@ pub fn repack_q4k_soa_host(
     for row in 0..rows {
         let row_vals = &vals[row * k..(row + 1) * k];
         let row_qs = &mut qs[row * half_k..(row + 1) * half_k];
-        for (j, out) in row_qs.iter_mut().enumerate() {
-            *out = row_vals[j] | (row_vals[j + half_k] << 4);
+        for chunk in 0..k / 512 {
+            let chunk_vals = &row_vals[chunk * 512..(chunk + 1) * 512];
+            let chunk_qs = &mut row_qs[chunk * 256..(chunk + 1) * 256];
+            for (j, out) in chunk_qs.iter_mut().enumerate() {
+                *out = chunk_vals[j] | (chunk_vals[j + 256] << 4);
+            }
         }
     }
     Ok((qs, sc, mins))

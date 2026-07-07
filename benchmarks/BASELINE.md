@@ -468,3 +468,41 @@ row (byte j of chunk c = elem 512c+j | elem 512c+256+j << 4) so one
 again and removing the hi-plane column offset; small k_v shapes underfill
 the grid at 64 blocks/launch and may want a row-split variant. The 4B/8B
 release coherence gates pass on this rev.
+
+## Phase 2 Q4K SoA GEMV v3 (chunk-local nibble planes)
+
+Run mode: desktop/display-attached. Version block unchanged.
+
+v3 repacks nibble planes per 512-element chunk (byte j of chunk c =
+elem 512c+j | elem 512c+256+j << 4) instead of per row, and the kernel
+fuses both planes into one [16,512] value tile via rank-2 `cat` (which,
+unlike rank-2 `shri`, lowers correctly in cuTile 0.2.0). One x/sc/mins
+load now serves both planes: 3 aux loads per 512 elements (v2: 6, v1: 20)
+with all column indices contiguous. Same signatures, storage, and byte
+budget as v2; only the loader mapping and kernel body changed.
+
+Sweep (best rows): 4b_ffn_gate_up 355, 4b_attn_output 364, 8b_ffn_gate_up
+389, 8b_attn_q_o 330, small k_v shapes 251-299 GB/s (v2: 285-322 large /
+183-195 small; v1: 126-198). Occupancy 4 retained (wins the byte-dominant
+gate_up shapes; near-tied elsewhere).
+
+End-to-end (grout_bench, 19-token prompt, 64 new tokens, greedy, 1 warmup
++ 2 timed reps); release coherence gate passes on this rev:
+
+| model | decode tok/s | v2 | v1 SoA | vs llama.cpp | hard gate |
+|---|---:|---:|---:|---|---|
+| Qwen3-4B Q4_K_M | 114.2 | 104.9 | 80.8 | 149.1 -> 77% | 135: at 85% |
+| Qwen3-8B Q4_K_M | 64.6 | 57.8 | 46.9 | 90.0 -> 72% | 84: at 77% |
+
+Note on bf16: evaluated and rejected for this path. The GGUF source scales
+are f16-native, effective-scale products sit far inside f16 range, and the
+kernels accumulate in f32; bf16 storage would cost ~3 mantissa bits for a
+range benefit nothing here needs, at identical bytes and identical sm_89
+throughput.
+
+Remaining gap: Q4K large shapes at ~330-390 GB/s vs Q6K's 405-464 with the
+same tile structure; the residual difference tracks the extra unpack
+arithmetic (mask, subtract, scale, cat) per byte. Candidate next steps if
+the gates demand them: LATENCY sweep on the tko loads, and an occupancy=2
+compile of the two k_v shapes; beyond that the format is near its
+arithmetic floor and gate progress likely comes from attention/glue.

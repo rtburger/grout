@@ -1142,8 +1142,10 @@ fn repack_q4k_soa_reconstructs_reference() -> Result<()> {
     for (e, &expected) in reference.iter().enumerate() {
         let row = e / k;
         let pos = e % k;
-        let byte = qs[row * half_k + pos % half_k];
-        let q = if pos < half_k { byte & 0xF } else { byte >> 4 };
+        let chunk = pos / 512;
+        let within = pos % 512;
+        let byte = qs[row * half_k + chunk * 256 + within % 256];
+        let q = if within < 256 { byte & 0xF } else { byte >> 4 };
         let recon = sc[e / 32].to_f32() * (q as f32) - mins[e / 32].to_f32();
         // Effective scales are f16-rounded products (d*sc6, dmin*m6).
         let tol = 2.0e-3f32 * expected.abs().max(1.0);
