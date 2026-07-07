@@ -376,3 +376,52 @@ standalone GB/s microbench for gemv_q4k_soa_f16/gemv_q6k_soa_f16 at the exact
 4B/8B shapes with an occupancy sweep (as done for Q8_0 SoA) before any kernel
 churn; that microbench is not yet written and the occupancy=4 dispatch value
 is inherited from the Q8_0 sweep, not measured for these kernels.
+
+## Phase 2 K-quant SoA microbench sweep + measured occupancy
+
+Run mode: desktop/display-attached. Version block unchanged from the
+K-quant SoA checkpoint above (driver 595.58.03, CUDA 13.3, tileiras 13.3,
+RTX 4070 sm_89).
+
+`kquant_soa_microbench` sweeps both SoA GEMV kernels at the exact 4B/8B
+decode shapes with occupancy {1,2,4}, rotating >=64 MB of independent weight
+copies so small shapes stream from DRAM rather than L2 (fixes the artifact
+noted on the Q8_0 SoA rows). Best-occupancy row per shape:
+
+| kernel | shape | rows x k | best occ | GB/s |
+|---|---|---|---:|---:|
+| q6k_soa | 4b_lm_head | 151936 x 2560 | any | 454 |
+| q6k_soa | 8b_lm_head | 151936 x 4096 | any | 464 |
+| q6k_soa | 4b_ffn_down | 2560 x 9728 | any | 405 |
+| q6k_soa | 8b_ffn_down | 4096 x 12288 | any | 406 |
+| q6k_soa | 4b_attn_v | 1024 x 2560 | 1 | 335 (occ4: 190) |
+| q6k_soa | 8b_attn_v | 1024 x 4096 | 1 | 374 |
+| q4k_soa | 4b_attn_q | 4096 x 2560 | 4 | 183 |
+| q4k_soa | 4b_ffn_gate_up | 9728 x 2560 | 4 | 198 |
+| q4k_soa | 8b_attn_q_o | 4096 x 4096 | 4 | 178 |
+| q4k_soa | 8b_ffn_gate_up | 12288 x 4096 | 4 | 195 |
+| q4k_soa | 8b_ffn_down_q4k | 4096 x 12288 | 1 | 194 |
+
+Reproduce: `target/release/kquant_soa_microbench --iters 20 --warmup-iters 5`.
+
+Dispatch now uses the measured occupancies: Q6K SoA occupancy 1, Q4K SoA
+occupancy 4. Read: the Q6K kernel is at 80-92% of roofline and done; the
+Q4K kernel lands 126-198 GB/s at every shape and is the dominant remaining
+cost (decode GEMVs are ~94% of token time; Q4K bytes are ~60-75% of decode
+traffic on both models). Next structural lever is a Q4K kernel/layout rev,
+not occupancy.
+
+End-to-end after tuning (grout_bench, 19-token prompt, 64 new tokens,
+greedy, 1 warmup + 2 timed reps):
+
+| model | prefill_ms | decode tok/s | vs llama.cpp | gate (AGENTS #11) |
+|---|---:|---:|---|---|
+| Qwen3-4B Q4_K_M | 220 | 84.5 | 149.1 -> 57% | hard 135: below |
+| Qwen3-8B Q4_K_M | 433 | 46.9 | 90.0 -> 52% | hard 84: below |
+
+First 8B landing on the 12 GB card: VRAM preflight passes at the default
+16k context in desktop mode thanks to SoA-only residency for projections;
+output coherent, reps stable at 46.9/47.0. Both models remain below their
+hard gates with the gap fully attributed to Q4K SoA kernel bandwidth; at
+Q6K-class 400+ GB/s for Q4K, projected landings are ~125-130 (4B) and
+~75-80 (8B) tok/s.
