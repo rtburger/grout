@@ -5289,7 +5289,7 @@ impl Qwen3Engine {
                 )
                 .generics(q6k_soa_gemv_generics(part.cols()))
                 .grid(((part.rows() / 8) as u32, 1u32, 1u32))
-                .compile_options(CompileOptions::default().occupancy(4))
+                .compile_options(CompileOptions::default().occupancy(Q6K_SOA_OCCUPANCY))
                 .execute(ctx)?
             };
             return Ok(result.0.unpartition());
@@ -5903,7 +5903,7 @@ impl Qwen3Engine {
                         )
                     }
                     .generics(q6k_soa_gemv_generics(part.cols()))
-                    .compile_options(CompileOptions::default().occupancy(4)),
+                    .compile_options(CompileOptions::default().occupancy(Q6K_SOA_OCCUPANCY)),
                 )?;
             }
             crate::dequant::GgmlType::Q5K => {
@@ -6003,7 +6003,7 @@ impl Qwen3Engine {
                             part.rows() as i32,
                         )
                         .generics(q6k_soa_gemv_generics(part.cols()))
-                        .compile_options(CompileOptions::default().occupancy(4))
+                        .compile_options(CompileOptions::default().occupancy(Q6K_SOA_OCCUPANCY))
                         .sync_on(stream)
                         .map_err(|e| anyhow::anyhow!("{label} q6k soa gemv failed: {e:?}"))?;
                     } else {
@@ -7217,6 +7217,11 @@ fn concat_weight_rows_2d(
     };
     Ok(MatrixWeight::single(Weight::f16(Arc::new(merged))?))
 }
+
+// Measured on the 4070 (kquant_soa_microbench occupancy sweep): Q6K SoA
+// prefers occupancy 1 (small shapes 335 vs 190 GB/s at occupancy 4; large
+// shapes flat), Q4K SoA prefers occupancy 4.
+const Q6K_SOA_OCCUPANCY: i32 = 1;
 
 fn q6k_soa_gemv_generics(k: usize) -> Vec<String> {
     vec![
