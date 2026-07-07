@@ -28,6 +28,10 @@ struct Args {
     #[arg(long, value_delimiter = ',', default_value = "1,2,4")]
     occupancies: Vec<i32>,
 
+    /// tko load latency hints to sweep, comma-separated.
+    #[arg(long, value_delimiter = ',', default_value = "1")]
+    latencies: Vec<i32>,
+
     /// Print only CSV rows, without header.
     #[arg(long)]
     no_header: bool,
@@ -159,21 +163,25 @@ fn main() -> Result<()> {
 
     if !args.no_header {
         println!(
-            "backend,label,rows,k,copies,occupancy,weight_bytes,total_bytes,iters,total_ms,avg_us,achieved_gbps"
+            "backend,label,rows,k,copies,occupancy,latency,weight_bytes,total_bytes,iters,total_ms,avg_us,achieved_gbps"
         );
     }
 
-    for occupancy in &args.occupancies {
-        ensure!(*occupancy > 0, "occupancy values must be positive");
-        for shape in SHAPES {
-            run_shape(
-                &ctx,
-                &stream,
-                shape,
-                *occupancy,
-                args.warmup_iters,
-                args.iters,
-            )?;
+    for latency in &args.latencies {
+        ensure!(*latency > 0, "latency values must be positive");
+        for occupancy in &args.occupancies {
+            ensure!(*occupancy > 0, "occupancy values must be positive");
+            for shape in SHAPES {
+                run_shape(
+                    &ctx,
+                    &stream,
+                    shape,
+                    *occupancy,
+                    *latency,
+                    args.warmup_iters,
+                    args.iters,
+                )?;
+            }
         }
     }
     Ok(())
@@ -260,6 +268,7 @@ fn launch(
     activation: &Arc<Tensor<f16>>,
     out: Tensor<f16>,
     occupancy: i32,
+    latency: i32,
     timed: bool,
 ) -> Result<Tensor<f16>> {
     let rows = shape.rows;
@@ -282,7 +291,7 @@ fn launch(
                 k.to_string(),
                 (k / 16).to_string(),
                 (k / 256).to_string(),
-                "1".to_string(),
+                latency.to_string(),
             ])
             .grid(grid)
             .compile_options(opts);
@@ -308,7 +317,7 @@ fn launch(
             .generics(vec![
                 (k / 2).to_string(),
                 (k / 32).to_string(),
-                "1".to_string(),
+                latency.to_string(),
             ])
             .grid(grid)
             .compile_options(opts);
@@ -322,11 +331,13 @@ fn launch(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_shape(
     ctx: &ExecutionContext,
     stream: &Arc<Stream>,
     shape: Shape,
     occupancy: i32,
+    latency: i32,
     warmup_iters: usize,
     iters: usize,
 ) -> Result<()> {
@@ -360,6 +371,7 @@ fn run_shape(
             &activation,
             out,
             occupancy,
+            latency,
             false,
         )?;
     }
@@ -376,6 +388,7 @@ fn run_shape(
             &activation,
             out,
             occupancy,
+            latency,
             true,
         )?;
     }
@@ -393,12 +406,13 @@ fn run_shape(
         Dtype::Q6K => "q6k_soa_tile",
     };
     println!(
-        "{backend},{},{},{},{},{},{},{},{},{:.6},{:.3},{:.3}",
+        "{backend},{},{},{},{},{},{},{},{},{},{:.6},{:.3},{:.3}",
         shape.label,
         shape.rows,
         shape.k,
         copies,
         occupancy,
+        latency,
         w_bytes,
         total_bytes,
         iters,

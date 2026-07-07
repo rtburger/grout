@@ -5306,7 +5306,7 @@ impl Qwen3Engine {
                 )
                 .generics(q4k_soa_gemv_generics(part.cols()))
                 .grid(((part.rows() / 16) as u32, 1u32, 1u32))
-                .compile_options(CompileOptions::default().occupancy(4))
+                .compile_options(CompileOptions::default().occupancy(q4k_soa_occupancy(part.rows())))
                 .execute(ctx)?
             };
             return Ok(result.0.unpartition());
@@ -5863,7 +5863,9 @@ impl Qwen3Engine {
                         )
                     }
                     .generics(q4k_soa_gemv_generics(part.cols()))
-                    .compile_options(CompileOptions::default().occupancy(4)),
+                    .compile_options(
+                        CompileOptions::default().occupancy(q4k_soa_occupancy(part.rows())),
+                    ),
                 )?;
             }
             crate::dequant::GgmlType::Q6K => {
@@ -5970,7 +5972,9 @@ impl Qwen3Engine {
                             part.rows() as i32,
                         )
                         .generics(q4k_soa_gemv_generics(part.cols()))
-                        .compile_options(CompileOptions::default().occupancy(4))
+                        .compile_options(
+                            CompileOptions::default().occupancy(q4k_soa_occupancy(part.rows())),
+                        )
                         .sync_on(stream)
                         .map_err(|e| anyhow::anyhow!("{label} q4k soa gemv failed: {e:?}"))?;
                     } else {
@@ -7211,8 +7215,13 @@ fn concat_weight_rows_2d(
 
 // Measured on the 4070 (kquant_soa_microbench occupancy sweep): Q6K SoA
 // prefers occupancy 1 (small shapes 335 vs 190 GB/s at occupancy 4; large
-// shapes flat), Q4K SoA prefers occupancy 4.
+// shapes flat). Q4K SoA prefers occupancy 4 on the byte-dominant large
+// shapes but occupancy 1 on small-row k/v projections (251 vs 223 GB/s).
 const Q6K_SOA_OCCUPANCY: i32 = 1;
+
+fn q4k_soa_occupancy(rows: usize) -> i32 {
+    if rows <= 1024 { 1 } else { 4 }
+}
 
 fn q6k_soa_gemv_generics(k: usize) -> Vec<String> {
     vec![
