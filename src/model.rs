@@ -1793,15 +1793,22 @@ impl Qwen3Engine {
                 let _ = self.rope_seq_ctx(ctx, q, 0)?;
             }
             KernelKind::KvCacheUpdateSeq => {
-                let new_k = unsafe {
-                    api::zeros::<f16>(&[1, self.cfg.num_key_value_heads, self.cfg.head_dim])
-                        .execute(ctx)?
-                };
-                let new_v = unsafe {
-                    api::zeros::<f16>(&[1, self.cfg.num_key_value_heads, self.cfg.head_dim])
-                        .execute(ctx)?
-                };
-                self.kv_cache_update_seq_ctx(ctx, 0, new_k, new_v, 0)?;
+                // Warm both routes: seq_len=1 => dynpos (decode/fallback),
+                // seq_len>1 => BM_S-sharded bulk prefill kernel.
+                for s_len in [1usize, 2usize] {
+                    if s_len > self.max_seq_len {
+                        continue;
+                    }
+                    let new_k = unsafe {
+                        api::zeros::<f16>(&[s_len, self.cfg.num_key_value_heads, self.cfg.head_dim])
+                            .execute(ctx)?
+                    };
+                    let new_v = unsafe {
+                        api::zeros::<f16>(&[s_len, self.cfg.num_key_value_heads, self.cfg.head_dim])
+                            .execute(ctx)?
+                    };
+                    self.kv_cache_update_seq_ctx(ctx, 0, new_k, new_v, 0)?;
+                }
             }
             KernelKind::FlashAttnCausalSeq => {
                 // Warm both decode (q_len=1 => ATTN_BN_DECODE) and prefill (q_len>1 => ATTN_BN_PREFILL).
@@ -6568,15 +6575,20 @@ impl Qwen3Engine {
         let bm_s = env_usize_or("GROUT_KV_CACHE_BM_S", KV_CACHE_BM_S_DEFAULT);
         let (k_cache, v_cache): (Partition<Tensor<f16>>, Partition<Tensor<f16>>) =
             match position_input {
-                PositionInput::Host(position_start) => {
-                    debug_assert_eq!(
-                        *position_start, 0,
-                        "kv_cache_update_seq_f16 assumes position_start==0 \
-                         (prefill path); got {position_start}"
+                PositionInput::Host(position_start) if seq_len > 1 && *position_start == 0 => {
+                    // Bulk-prefill fast path. kv_cache_update_seq_f16 IGNORES
+                    // position_start and writes absolute cache slots
+                    // [0, seq_len), so it is only sound for position_start==0;
+                    // the match guard routes every other case to the dynpos
+                    // kernel below. The ensure! keeps a future guard edit from
+                    // silently corrupting the cache in release builds.
+                    ensure!(
+                        *position_start == 0,
+                        "kv_cache_update_seq_f16 writes absolute slots [0, seq_len) \
+                         and requires position_start==0; got {position_start}"
                     );
-                    // Host (prefill) path uses the new BM_S-sharded
-                    // kernel: partition tile is [1, BM_S, VEC_BLOCK] so
-                    // the grid becomes (num_kv_heads, max_seq_len/BM_S, 1).
+                    // BM_S-sharded kernel: partition tile is [1, BM_S, VEC_BLOCK]
+                    // so the grid becomes (num_kv_heads, max_seq_len/BM_S, 1).
                     let k_cache_part = k_cache.partition([1, bm_s, VEC_BLOCK]);
                     let v_cache_part = v_cache.partition([1, bm_s, VEC_BLOCK]);
                     let result = unsafe {
@@ -6597,9 +6609,25 @@ impl Qwen3Engine {
                     };
                     (result.2, result.3)
                 }
-                PositionInput::Device(position_start) => {
-                    // Device (decode) path. CHUNK_D sharding expands grid
-                    // from (kv_heads, 1, 1) to (kv_heads, 1, head_dim/CHUNK_D).
+                _ => {
+                    // Position-honoring path: single-token decode and any
+                    // nonzero-position write go through the dynpos kernel —
+                    // the same kernel the CUDA-graph decode runner records —
+                    // so graph and non-graph decode share KV-update semantics.
+                    // A host position is uploaded into a [1] u32 device
+                    // tensor; only the non-graph fallback/diagnostic path
+                    // pays this per-layer upload.
+                    let position_start: Arc<Tensor<u32>> = match position_input {
+                        PositionInput::Host(position_start) => {
+                            let pos_host = Arc::new(vec![*position_start as u32]);
+                            Arc::new(unsafe {
+                                api::copy_host_vec_to_device(&pos_host).execute(ctx)?
+                            })
+                        }
+                        PositionInput::Device(position_start) => position_start.clone(),
+                    };
+                    // CHUNK_D sharding expands grid from (kv_heads, 1, 1) to
+                    // (kv_heads, 1, head_dim/CHUNK_D).
                     let chunk_d =
                         env_usize_or("GROUT_KV_CACHE_DYN_CHUNK_D", KV_CACHE_DYN_CHUNK_D_DEFAULT);
                     let k_cache_part = k_cache.partition([1, self.max_seq_len, chunk_d]);
@@ -6610,7 +6638,7 @@ impl Qwen3Engine {
                             value(new_v),
                             value(k_cache_part),
                             value(v_cache_part),
-                            value(position_start.clone()),
+                            value(position_start),
                             value(seq_len as i32),
                         )
                         .generics(vec![

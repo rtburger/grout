@@ -2177,10 +2177,10 @@ pub mod kernels {
     // BM_S iterations (vs seq_len before). Grid now scales with
     // max_seq_len instead of being pinned to num_kv_heads=8.
     //
-    // ASSUMPTION: position_start is a multiple of BM_S. Prefill always
-    // passes 0, so this holds in practice. If a future caller needs
-    // mid-stream writes at arbitrary offsets, they should use the
-    // dynpos variant or extend this kernel.
+    // ASSUMPTION: position_start == 0. The host wrapper
+    // (kv_cache_update_seq_arc_ctx_with_position) enforces this with a
+    // hard ensure! and routes single-token and nonzero-position writes
+    // to the dynpos variant, which honors the position.
     #[cutile::entry(print_ir=false,
                        unchecked_accesses=true,
                        optimization_hints = (
@@ -2191,7 +2191,7 @@ pub mod kernels {
         new_v: &Tensor<f16, { [-1, -1, D] }>,
         k_cache: &mut Tensor<f16, { [1, BM_S, BLOCK_SIZE] }>,
         v_cache: &mut Tensor<f16, { [1, BM_S, BLOCK_SIZE] }>,
-        _position_start: i32, // asserted == 0 at call site; kept for ABI parity
+        _position_start: i32, // ensure!'d == 0 at call site; kept for ABI parity
         seq_len: i32,
     ) {
         let pid: (i32, i32, i32) = get_tile_block_id();
