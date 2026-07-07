@@ -79,10 +79,13 @@ fn selected_fast_compute_type(
     let default_ty = cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F;
     let compute16_env = std::env::var("GROUT_CUBLAS_COMPUTE16").ok();
     let compute16_enabled = match compute16_env.as_deref() {
-        Some("0") => false,
-        Some(_) => true,
+        // Strict parse: only "1" forces f16 accumulation for all k (the old
+        // default behavior); any other set value disables it. Previously
+        // "false"/"off"/"no" ENABLED it.
+        Some("1") => true,
+        Some(_) => false,
         None => {
-            match device_compute_capability(device_id) {
+            let arch_prefers = match device_compute_capability(device_id) {
                 // B200/sm_100 retune, 2026-05-01:
                 // - 4B decode GEMVs prefer 32F_FAST_16F across the board.
                 // - 32B decode GEMVs mostly prefer 32F_FAST_16F, except
@@ -90,7 +93,17 @@ fn selected_fast_compute_type(
                 // Keep the old compute16 default on sm_120/RTX 5090.
                 Some((10, 0)) => n == 1 && m == 51200 && k == 5120,
                 _ => true,
-            }
+            };
+            // f16 accumulation saturates at 65504 and the overflow risk
+            // grows with the dot-product length: prefill GEMMs over the
+            // dequant scratch reach k ≈ 10k. Auto mode keeps compute16 for
+            // short-k shapes only; force with GROUT_CUBLAS_COMPUTE16=1 or
+            // retune the bound with GROUT_CUBLAS_COMPUTE16_MAX_K.
+            let max_k = std::env::var("GROUT_CUBLAS_COMPUTE16_MAX_K")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(4096);
+            arch_prefers && (k as usize) <= max_k
         }
     };
     if !compute16_enabled {
