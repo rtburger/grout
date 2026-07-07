@@ -2730,9 +2730,14 @@ pub mod kernels {
     // bandwidth versus fmha_prefill_causal (the structural gap at long pp
     // vs FlashInfer/vLLM).
     //
-    // Q partition tile:   [BM, GROUP, D]   → grid = (q_len/BM, kv_heads)
+    // Q partition tile:   [BM, GROUP, D]   → grid = (q_len/BM, q_heads/GROUP)
     // K/V partition tile: [1, BN, D]       → loaded ONCE per j iteration
     // Out partition tile: [BM, GROUP, D]   → matches Q layout
+    //
+    // pid.1 indexes the Q head-group tile (q_heads/GROUP of them); Q and
+    // the per-CTA out tile use it directly. kv_head_idx derives from it
+    // for K/V only — when GROUP < query_group_size several head-group
+    // tiles share one kv_head.
     //
     // Internally the Q tile is flattened to [M_EFF, D] with M_EFF =
     // BM*GROUP. Row r in M_EFF corresponds to (m, g) = (r/GROUP, r%GROUP)
@@ -2775,7 +2780,8 @@ pub mod kernels {
     ) {
         let pid: (i32, i32, i32) = get_tile_block_id();
         let q_m_idx = pid.0;
-        let kv_head_idx = pid.1 * GROUP / query_group_size;
+        let q_group_idx = pid.1;
+        let kv_head_idx = q_group_idx * GROUP / query_group_size;
 
         // Scale to log2 base: exp2(x * s / log2) = exp(x * s). Fused into
         // the `qk * scale - m_ij` op below.
@@ -2822,7 +2828,7 @@ pub mod kernels {
         let q_part: Partition<f16, { [BM, GROUP, D] }> = q.partition(const_shape![BM, GROUP, D]);
         let tq_raw: Tile<f16, { [BM, GROUP, D] }> = load_view_tko(
             &q_part,
-            [q_m_idx, kv_head_idx, 0i32],
+            [q_m_idx, q_group_idx, 0i32],
             ordering::Weak,
             scope::TileBlock,
             Some(LATENCY),
