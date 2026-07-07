@@ -64,7 +64,10 @@ if [[ -n "$LOCK_MHZ" ]]; then
         exit 2
     fi
     echo "Locking GPU clock to ${LOCK_MHZ} MHz for this sweep…"
-    sudo nvidia-smi --lock-gpu-clocks="${LOCK_MHZ},${LOCK_MHZ}" >/dev/null
+    if ! sudo nvidia-smi --lock-gpu-clocks="${LOCK_MHZ},${LOCK_MHZ}" >/dev/null; then
+        echo "ERROR: failed to lock GPU clocks to ${LOCK_MHZ} MHz; refusing to run a sweep that would be labeled clock_lock=${LOCK_MHZ} on unlocked clocks" >&2
+        exit 2
+    fi
     cleanup_clocks() {
         echo "Resetting GPU clocks…"
         sudo nvidia-smi --reset-gpu-clocks >/dev/null || true

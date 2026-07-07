@@ -97,7 +97,7 @@ run_one() {
     | grep -E '^\s+\[timed\]' \
     | awk -F'decode_ms=' '{print $2}' | awk -F',' '{print $1}' \
     | sort -n \
-    | awk -v reps="$BENCH_REPS" 'BEGIN{mid=int((reps+1)/2)} NR==mid{med=$1} END{printf "%.2f", med}'
+    | awk -v reps="$BENCH_REPS" 'BEGIN{mid=int((reps+1)/2)} NR==mid{med=$1} END{ if (med=="") print "NA"; else printf "%.2f", med }'
 }
 
 for TG in "${TG_VALUES[@]}"; do
